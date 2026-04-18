@@ -26,6 +26,16 @@ class TestRagApi(unittest.TestCase):
             r2 = client.get("/ui/")
         self.assertEqual(r2.status_code, 200)
         self.assertIn(b"Knowledge RAG", r2.content)
+        self.assertIn(b"/v1/ask/stream", r2.content)
+
+    def test_prometheus_metrics_endpoint(self) -> None:
+        with TestClient(app) as client:
+            r = client.get("/metrics")
+        if r.status_code == 404:
+            self.skipTest("Prometheus disabled (RAG_PROMETHEUS_METRICS=0)")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("text/plain", r.headers.get("content-type", ""))
+        self.assertIn(b"http_requests", r.content)
 
     def test_request_id_header(self) -> None:
         with TestClient(app) as client:

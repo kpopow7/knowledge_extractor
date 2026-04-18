@@ -22,6 +22,7 @@ from rag_api import job_store
 from rag_api.job_store import IngestJobRecord
 from rag_api.logging_config import configure_logging
 from rag_api.otel import configure_opentelemetry
+from rag_api.prometheus_setup import configure_prometheus
 from rag_api.quotas import assert_under_quota, record_success
 from rag_api.rate_limit_key import rate_limit_key
 from rag_api.registry_resolve import resolve_index_db
@@ -430,6 +431,8 @@ def admin_reindex_document(
         raise HTTPException(status_code=500, detail=str(e)) from e
     return {"reindexed": True, "content_sha256": content_sha256, "force": force}
 
+
+configure_prometheus(app)
 
 _web_dir = Path(__file__).resolve().parent / "web"
 if _web_dir.is_dir():

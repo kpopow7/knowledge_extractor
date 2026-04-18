@@ -15,9 +15,9 @@ Use this as a checklist. Items marked **Done** reflect the repository today; oth
 | **Phase 1 — Ingest & extract** | PDF → structured IR + **registry** (SQLite), **content-addressed** storage under `documents/<sha256>/`, idempotent ingest | Long-running work should run in a **worker** (queue/cron); production swaps local `storage/` for **object storage** + managed DB |
 | **Phase 2 — Chunk** | **Done (entry):** read `extraction.json`, emit **JSONL** chunk records with sliding windows (default **20% overlap**), heuristic **section_path**, `text_embed` prefix; optional registry update | Bump `CHUNKER_VERSION` in `rag_chunker/__init__.py` when logic changes; same version + existing `chunks.jsonl` skips unless `--force` |
 | **Phase 3 — Embed & index** | **Done (entry):** embed `text_embed`, store **float32** vectors + **FTS5** keyword index in per-document **SQLite** (`storage/index/<sha256>.sqlite`); **`search`** runs **cosine + BM25 → RRF** | Production: swap SQLite for **pgvector + Postgres FTS** or a hosted hybrid service; keep `embedding_model` + dims in registry |
-| **Phase 4 — Retrieve** | **Done (entry):** wide hybrid pool + **rerank** (`none` \| **cohere** \| **cross-encoder**); **`rag_eval`** JSONL runner (**MRR**, **recall@k**); **`POST /v1/retrieve`** on **`rag_api`** | Tune thresholds on a fixed eval set |
-| **Phase 5 — Generate** | **Done (entry):** **`rag_generate ask`** — OpenAI Chat with **`rag_retrieve`** context + source list; **`POST /v1/ask`** on **`rag_api`** | Add logging, moderation, streaming, non-OpenAI providers |
-| **Platform** | **Done (entry):** optional **API keys**, **CORS**, **rate limits**, **request IDs** + logs; **`POST /v1/ingest`** runs **ingest → chunk → index** with job rows in **`api_jobs.sqlite`**; **`REDIS_URL`** + **RQ** worker (**`rag`**) or **`BackgroundTasks`** if Redis unset; **Docker Compose**: **Redis** + **api** + **worker** + **`/data` volume** | Tenants/quotas; **S3** + **managed DB** at scale |
+| **Phase 4 — Retrieve** | **Done:** wide hybrid pool + **rerank** (`none` \| **cohere** \| **cross-encoder**); **`rag_eval`** JSONL runner (**MRR**, **recall@k**) + **`rag_eval gate`** for CI; **`POST /v1/retrieve`** on **`rag_api`** | Tune thresholds on a fixed eval set |
+| **Phase 5 — Generate** | **Done:** **`rag_generate ask`**, **`POST /v1/ask`**, **`POST /v1/ask/stream`** (SSE token stream) — OpenAI Chat with **`rag_retrieve`** context + citations | Non-OpenAI providers; moderation |
+| **Platform** | **Done:** API keys + optional **`RAG_TENANTS_FILE`** (multi-tenant + **daily quotas**); **SlowAPI** (per-tenant or IP); **`POST /v1/ingest`** → job store; **Redis/RQ** or **`BackgroundTasks`**; **web UI** (`/ui/`); **admin** routes; **timeouts** on retrieve/LLM; **optional embedding disk cache**; **OpenTelemetry** (OTLP), **Sentry**, **Prometheus `/metrics`**; **CI eval gate** | **S3** + **managed DB** at scale; stronger quota backends |
 
 ---
 
@@ -43,9 +43,13 @@ Use this as a checklist. Items marked **Done** reflect the repository today; oth
   - **`rag_eval`** — eval cases as **JSONL** (`EvalCase`: `id`, `question`, optional `gold_chunk_ids`, `gold_pages`, `gold_substrings`); reports **MRR** and **recall@k**.
 - **Phase 5 (generate — entry):**
   - **`rag_generate ask`** — runs **`retrieve`** (same `--rerank` / pool flags), builds a context block from hits, calls **OpenAI Chat Completions** (`OPENAI_API_KEY`, optional `OPENAI_CHAT_MODEL`, default `gpt-4o-mini`).
-- **HTTP API (`rag_api`) + workers (`rag_worker`):** **FastAPI** — **`GET /health`**, **`POST /v1/retrieve`**, **`POST /v1/ask`**, **`POST /v1/ingest`** (full pipeline **ingest → chunk → embed/index**), **`GET /v1/jobs/{job_id}`**; uploads land under **`storage/incoming/`** then **`REDIS_URL`** + **RQ worker** (Docker) or **in-process `BackgroundTasks`** when **`REDIS_URL`** is unset; optional **`RAG_API_KEYS`**, CORS, rate limits, **`X-Request-ID`**.
+- **HTTP API (`rag_api`) + workers (`rag_worker`):** **FastAPI** — **`GET /health`**, **`GET /metrics`** (Prometheus, optional), **`POST /v1/retrieve`**, **`POST /v1/ask`**, **`POST /v1/ask/stream`** (SSE: `retrieval` / `token` / `done` / `error` events), **`POST /v1/ingest`** (full pipeline **ingest → chunk → embed/index**), **`GET /v1/jobs/{job_id}`**; uploads under **`storage/incoming/`** then **`REDIS_URL`** + **RQ worker** or **`BackgroundTasks`** when Redis unset; optional **`RAG_API_KEYS`** and/or **`RAG_TENANTS_FILE`**, CORS, rate limits (keyed by **tenant** when a valid API key maps to a tenant), **`X-Request-ID`**; **admin** API (**`RAG_ADMIN_API_KEYS`**): list jobs, delete document, reindex. **Retrieve/ask timeouts** return **504** when budgets are exceeded.
+- **Web UI:** **`GET /`** redirects to **`/ui/`** — minimal single-page app: PDF upload, job polling, chat using **`/v1/ask/stream`** (same-origin; optional **`X-API-Key`** stored in `localStorage`).
+- **Observability:** optional **OTLP** traces (**`OTEL_EXPORTER_OTLP_ENDPOINT`**), **Sentry** (**`SENTRY_DSN`**), **Prometheus** scrape target **`GET /metrics`**.
+- **Embeddings:** optional on-disk cache when **`RAG_EMBEDDING_CACHE=1`** (`storage/cache/embedding_cache.sqlite`); never used for fake embeddings.
+- **Eval CI gate:** **`python -m rag_eval gate --workspace fixtures/eval/ci`** builds a temp index from **`chunks.jsonl`**, runs **`cases.jsonl`**, enforces **`thresholds.json`** (used in **GitHub Actions**).
 - **CLI:** `rag_extractor` also exposes **`eval`**, **`ask`** (forwarding to `rag_eval` / `rag_generate`).
-- **Tests:** smoke PDF; fast tests for ingest, chunk, index, retrieve, **eval** (fake embeddings), API **health** + validation.
+- **Tests:** smoke PDF; fast tests for ingest, chunk, index, retrieve, **eval** (fake embeddings), API **health**, **eval gate**, **admin**, **metrics**, UI static files.
 
 ---
 
@@ -59,12 +63,13 @@ Use this as a checklist. Items marked **Done** reflect the repository today; oth
 | `rag_retrieve/` | Phase 4 candidate pool + rerank (`pipeline`, `rerankers`, CLI) |
 | `rag_eval/` | Eval JSONL schema + MRR / recall@k runner |
 | `rag_generate/` | LLM answers with retrieved context (`answer`, CLI) |
-| `rag_api/` | FastAPI HTTP API, middleware, job store |
+| `rag_api/` | FastAPI HTTP API, middleware, job store, optional **`web/`** UI, admin auth, OTEL/Sentry/Prometheus hooks |
 | `rag_worker/` | Full document pipeline + RQ task entrypoints + **`python -m rag_worker.worker`** |
 | `rag_storage/` | Postgres schema/init, S3/local **blob** helpers, config |
-| `fixtures/eval/` | Example eval JSONL (lines starting with `#` are ignored) |
+| `fixtures/eval/` | Example eval JSONL (lines starting with `#` are ignored); **`ci/`** — fixed **chunks.jsonl** / **cases.jsonl** / **thresholds.json** for the **`rag_eval gate`** command |
 | `fixtures/pdfs/` | Example PDFs for local testing (optional; add your own) |
-| `storage/` | `registry.db`, `api_jobs.sqlite` (job rows), `incoming/` (uploaded PDFs awaiting processing), `documents/<sha256>/`, `index/<sha256>.sqlite`, optional `artifacts/` (**gitignored**) |
+| `storage/` | `registry.db`, `api_jobs.sqlite` (job rows), `tenant_usage.sqlite` (daily quota counters), `cache/embedding_cache.sqlite` (if **`RAG_EMBEDDING_CACHE=1`**), `incoming/` (uploaded PDFs awaiting processing), `documents/<sha256>/`, `index/<sha256>.sqlite`, optional `artifacts/` (**gitignored**) |
+| `.github/workflows/` | **CI** (unit tests + **`rag_eval gate`**) |
 | `tests/` | Unit/smoke tests |
 | `requirements.txt` | Python dependencies |
 
@@ -137,16 +142,57 @@ Copy [`.env.example`](.env.example) to **`.env`** in the project root and set se
 | `OPENAI_CHAT_MODEL` | Chat model for **`rag_generate ask`** (default `gpt-4o-mini`) |
 | `RAG_API_HOST` | HTTP API bind host (default `127.0.0.1`; **`python -m rag_api`**) |
 | `RAG_API_PORT` | HTTP API port (default `8000`) |
-| `RAG_API_KEYS` | Optional comma-separated API keys. If set, **`/v1/*`** requires **`X-API-Key: <key>`** or **`Authorization: Bearer <key>`** ( **`/health`** stays open). |
+| `RAG_API_KEYS` | Optional comma-separated API keys. If set (or if **`RAG_TENANTS_FILE`** is set), **`/v1/*`** requires **`X-API-Key: <key>`** or **`Authorization: Bearer <key>`** ( **`/health`**, **`/metrics`**, and the static **`/ui`** assets stay open without a key). |
 | `RAG_API_CORS_ORIGINS` | Optional comma-separated allowed browser origins (enables CORS when non-empty). |
-| `RAG_API_RATE_LIMIT` | SlowAPI limit for **`/v1/retrieve`**, **`/v1/ask`**, **`GET /v1/jobs/...`** (default `120/minute` per client IP). |
+| `RAG_API_RATE_LIMIT` | SlowAPI limit for **`/v1/retrieve`**, **`/v1/ask`**, **`/v1/ask/stream`**, **`GET /v1/jobs/...`** (default `120/minute`; keyed by **tenant** when the API key maps to a tenant, else **client IP**). |
 | `RAG_API_RATE_LIMIT_INGEST` | Limit for **`POST /v1/ingest`** (default `30/minute`). |
 | `RAG_API_LOG_LEVEL` | Root/uvicorn log level (default `INFO`). |
 | `REDIS_URL` | If set (e.g. `redis://localhost:6379/0`), **`POST /v1/ingest`** enqueues work on queue **`rag`**; run **`python -m rag_worker.worker`** (or the **worker** service in Docker). If unset, the pipeline runs in **`BackgroundTasks`** in the API process (dev-friendly; not for multi-replica APIs). |
 
+**Multi-tenant keys & quotas (optional)**
+
+| Variable | Meaning |
+|----------|---------|
+| `RAG_TENANTS_FILE` | Path to JSON listing tenants: each has `tenant_id`, `api_keys[]`, optional `quotas` (`asks_per_day`, `retrieves_per_day`, `ingests_per_day`). Keys in **`RAG_API_KEYS`** that are not listed here map to tenant **`default`** and use **`RAG_DEFAULT_QUOTA_*`**. |
+| `RAG_DEFAULT_QUOTA_ASKS_PER_DAY` | Optional integer cap for the default tenant (omit for unlimited). |
+| `RAG_DEFAULT_QUOTA_RETRIEVES_PER_DAY` | Same for **`/v1/retrieve`**. |
+| `RAG_DEFAULT_QUOTA_INGESTS_PER_DAY` | Same for **`/v1/ingest`**. |
+
+**Retrieve / LLM budgets (optional)**
+
+| Variable | Meaning |
+|----------|---------|
+| `RAG_RETRIEVE_TIMEOUT_SEC` | Max seconds for hybrid retrieval + rerank in API (default `90`; **504** on exceed). |
+| `RAG_LLM_TIMEOUT_SEC` | OpenAI client timeout for chat/embeddings where applicable (default `120`). |
+| `RAG_ASK_TOTAL_BUDGET_SEC` | Wall time for non-streaming **`/v1/ask`** (retrieve + completion; default `180`; **504**). |
+| `RAG_ASK_STREAM_BUDGET_SEC` | Max time for token streaming after retrieval (default `180`). |
+
+**Embeddings cache (optional)**
+
+| Variable | Meaning |
+|----------|---------|
+| `RAG_EMBEDDING_CACHE` | Set to `1` / `true` / `yes` to cache OpenAI embedding vectors on disk under **`storage/cache/embedding_cache.sqlite`**. Ignored when **`RAG_INDEX_FAKE_EMBEDDINGS=1`**. |
+
+**Observability (optional)**
+
+| Variable | Meaning |
+|----------|---------|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | OTLP/HTTP trace exporter; enables FastAPI tracing when set (unless **`OTEL_SDK_DISABLED=1`**). |
+| `OTEL_SERVICE_NAME` | Service name in traces (default `rag-api`). |
+| `OTEL_FASTAPI_EXCLUDED_URLS` | Comma-separated path substrings to skip tracing (default includes `health`, `metrics`). |
+| `SENTRY_DSN` | Enables **Sentry** error tracking + FastAPI integration. Optional: `SENTRY_TRACES_SAMPLE_RATE`, `SENTRY_ENVIRONMENT` / `RAG_ENV`. |
+| `RAG_PROMETHEUS_METRICS` | Set to `0` / `false` / `off` to disable **`GET /metrics`** (default: enabled when **prometheus-fastapi-instrumentator** is installed). |
+
+**Admin API (optional)**
+
+| Variable | Meaning |
+|----------|---------|
+| `RAG_ADMIN_API_KEYS` | Comma-separated keys; required for **`GET /v1/admin/jobs`**, **`DELETE /v1/admin/documents/{sha256}`**, **`POST /v1/admin/documents/{sha256}/reindex`**. Use header **`X-Admin-API-Key`** or **`Authorization: Bearer`**. If unset, admin routes return **403**. |
+| `RAG_ADMIN_RATE_LIMIT` | SlowAPI limit for admin routes (default `30/minute`). |
+
 ### HTTP API
 
-Requires the same **`RAG_STORAGE_ROOT`** layout as the CLI. For **`POST /v1/ask`** and for **embedding during ingest**, set **`OPENAI_API_KEY`** (or **`RAG_INDEX_FAKE_EMBEDDINGS=1`** for tests). Responses include **`X-Request-ID`** (pass the same header to correlate logs).
+Requires the same **`RAG_STORAGE_ROOT`** layout as the CLI. For **`POST /v1/ask`**, **`POST /v1/ask/stream`**, and **embedding during ingest**, set **`OPENAI_API_KEY`** (or **`RAG_INDEX_FAKE_EMBEDDINGS=1`** for tests). Responses include **`X-Request-ID`** (pass the same header to correlate logs). Rate limits use **tenant id** when the request’s API key resolves via **`RAG_TENANTS_FILE`**; otherwise the **client IP** is used.
 
 **Start server** (default `http://127.0.0.1:8000`; use `--host 0.0.0.0` to listen on all interfaces):
 
@@ -159,10 +205,19 @@ python -m rag_api --host 127.0.0.1 --port 8000
 | Method | Path | Body / notes |
 |--------|------|----------------|
 | `GET` | `/health` | Returns `{"status":"ok"}`. No API key required. |
-| `POST` | `/v1/retrieve` | JSON: **`query`** (required); **`sha256`** (registry id or prefix) *or* **`index_db`** (path to index SQLite); optional **`top`**, **`candidates`**, **`rerank`**. Response: **`hits`**. |
-| `POST` | `/v1/ask` | JSON: **`question`** (required); **`sha256`** or **`index_db`**; optional **`model`**, **`top`**, **`candidates`**, **`rerank`**. Response: **`answer`**, **`chunk_ids`**, **`pages`**. |
+| `GET` | `/metrics` | **Prometheus** text exposition (HTTP request metrics + process). Omit if **`RAG_PROMETHEUS_METRICS=0`** or exporter not installed. |
+| `GET` | `/` | **302** redirect to **`/ui/`** when the bundled web UI is present. |
+| `GET` | `/ui/` | Static **web UI** (upload PDF → poll jobs → chat). |
+| `POST` | `/v1/retrieve` | JSON: **`query`** (required); **`sha256`** (registry id or prefix) *or* **`index_db`** (path to index SQLite); optional **`top`**, **`candidates`**, **`rerank`**. Response: **`hits`**. Subject to retrieve timeout → **504**. |
+| `POST` | `/v1/ask` | JSON: **`question`** (required); **`sha256`** or **`index_db`**; optional **`model`**, **`top`**, **`candidates`**, **`rerank`**. Response: **`answer`**, **`chunk_ids`**, **`pages`**. Subject to ask budget → **504**. |
+| `POST` | `/v1/ask/stream` | Same JSON as **`/v1/ask`**. Response: **`text/event-stream`** with **`data:`** JSON lines: **`type`**: `retrieval` (chunk ids + pages), `token` (delta text), `done`, or `error`. |
 | `POST` | `/v1/ingest` | **Multipart** **`file`**: PDF only (must begin with **`%PDF`**); optional query **`force=true`**. Returns **`202`** with **`job_id`** and **`status`**: **`queued`** (Redis) or **`pending`** (in-process). Runs **ingest → chunk → index**; poll until **`ready`** before **`/v1/retrieve`** / **`/v1/ask`**. |
 | `GET` | `/v1/jobs/{job_id}` | Poll job status: **`pending`**, **`queued`**, **`ingesting`**, **`chunking`**, **`indexing`**, **`ready`**, **`failed`**; includes **`content_sha256`** and **`error_message`** when known. |
+| `GET` | `/v1/admin/jobs` | Query: **`limit`**, **`offset`**. Lists ingest jobs (newest first). Requires **admin** key. |
+| `DELETE` | `/v1/admin/documents/{sha256}` | Deletes registry row and on-disk artifacts (SQLite index file, **`documents/<sha>/`**, source PDF when under storage). Requires **admin** key. |
+| `POST` | `/v1/admin/documents/{sha256}/reindex` | Query: **`force`**. Rebuilds the vector index for an existing chunked document. Requires **admin** key. |
+
+**Quota exceeded:** **`429`** when the tenant’s daily cap is reached for ask / retrieve / ingest.
 
 OpenAPI docs: **`GET /docs`** (Swagger UI) when the server is running.
 
@@ -336,6 +391,15 @@ python -m rag_eval run --cases fixtures/eval/example_eval.jsonl --sha256 <prefix
 
 Optional: `--per-case out.jsonl` to dump per-question ranks and retrieved ids.
 
+**CI eval gate** (fixed workspace: **`chunks.jsonl`**, **`cases.jsonl`**, **`thresholds.json`** — see **`fixtures/eval/ci/`**):
+
+```powershell
+$env:RAG_INDEX_FAKE_EMBEDDINGS="1"
+python -m rag_eval gate --workspace fixtures/eval/ci
+```
+
+Exits **`1`** if metrics fall below **`thresholds.json`** (e.g. **`min_mrr`**, **`min_recall_at`** for chosen **k**). Used in **`.github/workflows/ci.yml`**.
+
 **Shortcut:** `python -m rag_extractor eval run --cases ... --sha256 ...`
 
 ### Grounded answers (`rag_generate`)
@@ -357,6 +421,10 @@ python -m unittest discover -s tests -v
 
 The large-PDF smoke test is skipped if `fixtures/pdfs/MPM_PS_US_MAR2026_02252026.pdf` is missing.
 
+### Continuous integration
+
+**`.github/workflows/ci.yml`** (on push/PR to **`main`** / **`master`**): installs **`requirements.txt`**, runs the full unit test suite, then **`python -m rag_eval gate --workspace fixtures/eval/ci`** with **`RAG_INDEX_FAKE_EMBEDDINGS=1`**.
+
 ---
 
 ## Dependencies (current)
@@ -366,19 +434,23 @@ Listed in `requirements.txt`:
 - **pymupdf** — PDF text, layout blocks, table detection
 - **pydantic** — Validated schemas (extraction + chunks)
 - **numpy** — Vector math for search
-- **openai** — Embedding API client
+- **openai** — Embedding + chat API client
 - **cohere** — Rerank API client (Phase 4)
 - **sentence-transformers** — Cross-encoder rerank (Phase 4); pulls **PyTorch** transitively
 - **fastapi** — HTTP API framework
 - **uvicorn** — ASGI server for **`python -m rag_api`**
 - **httpx** — Used by FastAPI’s test client (and compatible HTTP calls)
-- **slowapi** — Rate limiting for **`/v1/*`**
+- **slowapi** — Rate limiting for **`/v1/*`** and admin routes
 - **python-multipart** — Multipart uploads for **`POST /v1/ingest`**
 - **redis** — Broker for **RQ** when **`REDIS_URL`** is set
 - **rq** — Job queue; worker runs **`rag_worker.tasks.process_document_job`**
 - **psycopg** — PostgreSQL driver when **`DATABASE_URL`** is set
 - **pgvector** — Vector type registration for **psycopg**
 - **boto3** — S3 uploads when **`RAG_S3_BUCKET`** is set
+- **python-dotenv** — Load **`.env`** via **`rag_storage`**
+- **opentelemetry-**\* — Optional OTLP tracing (**`OTEL_EXPORTER_OTLP_*`**)
+- **sentry-sdk** — Optional error tracking (**`SENTRY_DSN`**)
+- **prometheus-client** + **prometheus-fastapi-instrumentator** — **`GET /metrics`**
 
 ---
 
@@ -394,16 +466,11 @@ Indexing and retrieval env vars are listed under **Environment** above.
 
 ---
 
-## Future setup (placeholders — fill in as you build)
+## Beyond the bundled UI
 
-When the following exist, document them here in the same PR that adds them:
+The included **static UI** under **`rag_api/web/`** is intended for same-origin use with the API (open **`/`** or **`/ui/`** after **`python -m rag_api`**). For a separate front-end (e.g. Next.js), point it at this API’s base URL, set **`RAG_API_CORS_ORIGINS`**, and use **`X-API-Key`** / **`Authorization`** as documented. You can call **`POST /v1/ask`** or **`POST /v1/ask/stream`** depending on whether you want streaming tokens.
 
-- **Web app** (e.g. Next.js on Vercel): install (`npm`/`pnpm`), `env` vars, `dev` / `build` / `start`; call **`POST /v1/ask`** or **`/v1/retrieve`** on this repo’s API (or a gateway in front of it)
-- **Database / vector store** (e.g. Postgres + pgvector, Pinecone, etc.): connection strings, migrations, indexes
-- **Keyword search** (same DB `tsvector`, Meilisearch, etc.): URLs, API keys, index names
-- **Workers** (Inngest, Trigger.dev, Celery, etc.): how jobs are triggered and secrets configured
-- **LLM / embedding APIs**: provider keys, model names, rate limits
-- **Object storage** (S3, R2, Vercel Blob): buckets, CORS, upload limits
+Other production topics to plan explicitly: managed **Postgres + pgvector** (**`DATABASE_URL`**), **object storage** (**`RAG_S3_*`**), job orchestration beyond **Redis/RQ**, and provider-specific **LLM / embedding** limits.
 
 ---
 

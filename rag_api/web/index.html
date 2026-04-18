@@ -160,7 +160,7 @@
 
     <section>
       <h2>3. Ask</h2>
-      <p class="hint" id="chatHint">Indexing must finish before you can chat.</p>
+      <p class="hint" id="chatHint">Indexing must finish before you can chat. Answers stream from <span class="mono">/v1/ask/stream</span>.</p>
       <div class="chat-log" id="chatLog"></div>
       <label for="question">Question</label>
       <textarea id="question" placeholder="Ask something about the uploaded document…" disabled></textarea>
@@ -270,7 +270,7 @@
     question.disabled = !on;
     btnAsk.disabled = !on;
     chatHint.textContent = on
-      ? "Questions use the document id from the job above."
+      ? "Questions use the document id from the job above. Answers stream from /v1/ask/stream."
       : "Indexing must finish before you can chat.";
   }
 
@@ -339,18 +339,23 @@
     }
   });
 
+  function formatPages(pages) {
+    if (!pages || !pages.length) return "";
+    return pages.map(function (p) {
+      if (!p || !p.length) return "—";
+      var a = p[0], b = p[1];
+      if (a == null && b == null) return "—";
+      if (b != null && b !== a) return a + "–" + b;
+      return String(a);
+    }).join(", ");
+  }
+
   function appendMsg(role, text, cites) {
     const div = document.createElement("div");
     div.className = "msg " + role;
     let citesHtml = "";
     if (cites && cites.length) {
-      citesHtml = '<div class="cites">Pages: ' + cites.map(function (p) {
-        if (!p || !p.length) return "—";
-        var a = p[0], b = p[1];
-        if (a == null && b == null) return "—";
-        if (b != null && b !== a) return a + "–" + b;
-        return String(a);
-      }).join(", ") + "</div>";
+      citesHtml = '<div class="cites">Pages: ' + formatPages(cites) + "</div>";
     }
     div.innerHTML =
       '<div class="role">' + (role === "user" ? "You" : "Assistant") + "</div>" +
@@ -369,10 +374,12 @@
       return;
     }
     btnAsk.disabled = true;
+    const sendLabel = btnAsk.textContent;
+    btnAsk.textContent = "Streaming…";
     appendMsg("user", q, null);
     question.value = "";
     try {
-      const res = await fetch("/v1/ask", {
+      const res = await fetch("/v1/ask/stream", {
         method: "POST",
         headers: apiHeaders(true),
         body: JSON.stringify({
@@ -387,8 +394,50 @@
         appendMsg("assistant", "(Error: " + msg + ")", null);
         return;
       }
-      const data = await res.json();
-      appendMsg("assistant", data.answer || "", data.pages || []);
+      const assistantRow = document.createElement("div");
+      assistantRow.className = "msg assistant";
+      assistantRow.innerHTML =
+        '<div class="role">Assistant</div>' +
+        '<div class="bubble"></div>' +
+        '<div class="cites" style="display:none;"></div>';
+      chatLog.appendChild(assistantRow);
+      const bubble = assistantRow.querySelector(".bubble");
+      const citesEl = assistantRow.querySelector(".cites");
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const step = await reader.read();
+        if (step.done) break;
+        buf += dec.decode(step.value, { stream: true });
+        var cut;
+        while ((cut = buf.indexOf("\n")) >= 0) {
+          var line = buf.slice(0, cut).trim();
+          buf = buf.slice(cut + 1);
+          if (!line.startsWith("data: ")) continue;
+          var ev;
+          try {
+            ev = JSON.parse(line.slice(6));
+          } catch (_) {
+            continue;
+          }
+          if (ev.type === "token" && ev.text) {
+            bubble.textContent += ev.text;
+            chatLog.scrollTop = chatLog.scrollHeight;
+          }
+          if (ev.type === "retrieval" && ev.pages && ev.pages.length) {
+            citesEl.style.display = "block";
+            citesEl.textContent = "Pages: " + formatPages(ev.pages);
+          }
+          if (ev.type === "error") {
+            var det = ev.detail || "stream error";
+            askErr.textContent = det;
+            askErr.style.display = "block";
+            bubble.textContent += "\n(Error: " + det + ")";
+          }
+        }
+      }
+      chatLog.scrollTop = chatLog.scrollHeight;
     } catch (e) {
       const msg = e && e.message ? e.message : String(e);
       askErr.textContent = msg;
@@ -396,6 +445,7 @@
       appendMsg("assistant", "(Error: " + msg + ")", null);
     } finally {
       btnAsk.disabled = false;
+      btnAsk.textContent = sendLabel;
     }
   });
 
