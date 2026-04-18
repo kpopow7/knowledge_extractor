@@ -8,6 +8,8 @@ from rag_extractor import EXTRACTION_VERSION
 from rag_extractor.extract import _sha256_file, extract_pdf, write_artifact
 from rag_extractor.paths import documents_dir, storage_root
 from rag_extractor.registry import DocumentRegistry
+from rag_storage.blob import write_blob
+from rag_storage.config import use_s3_blobs
 
 
 SOURCE_NAME = "source.pdf"
@@ -16,6 +18,16 @@ ARTIFACT_NAME = "extraction.json"
 
 def _doc_dir(content_sha256: str) -> Path:
     return documents_dir() / content_sha256
+
+
+def _mirror_to_object_storage(source_relpath: str, artifact_relpath: str | None) -> None:
+    """If ``RAG_S3_BUCKET`` is set, copy files under ``RAG_STORAGE_ROOT`` to the bucket."""
+    if not use_s3_blobs():
+        return
+    root = storage_root()
+    write_blob(source_relpath, (root / source_relpath).read_bytes())
+    if artifact_relpath and (root / artifact_relpath).is_file():
+        write_blob(artifact_relpath, (root / artifact_relpath).read_bytes())
 
 
 def _rel_to_storage(path: Path) -> str:
@@ -99,6 +111,7 @@ def ingest_pdf(
             page_count=artifact.page_count,
             artifact_relpath=artifact_rel,
         )
+        _mirror_to_object_storage(source_rel, artifact_rel)
     except Exception as e:  # noqa: BLE001
         reg.mark_failed(content_sha256=content_sha256, error_message=f"{type(e).__name__}: {e}")
         return IngestResult(

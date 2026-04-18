@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 from rag_index.search import SearchHit
+from rag_index.targets import SearchIndexTarget
 from rag_retrieve.pipeline import retrieve
 
 
@@ -21,7 +21,7 @@ def _format_context(hits: list[SearchHit], max_chars_per_chunk: int = 6000) -> s
 
 
 def answer_with_retrieval(
-    index_db: os.PathLike[str] | str,
+    index_ref: SearchIndexTarget | os.PathLike[str] | str,
     question: str,
     *,
     chat_model: str | None = None,
@@ -35,7 +35,7 @@ def answer_with_retrieval(
     Requires OPENAI_API_KEY (same client as embeddings).
     """
     hits = retrieve(
-        Path(index_db),
+        index_ref,
         question,
         final_k=final_k,
         candidate_pool=candidate_pool,

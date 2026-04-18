@@ -7,27 +7,13 @@ import sys
 from pathlib import Path
 
 from rag_retrieve.pipeline import retrieve
-from rag_extractor.paths import storage_root
-from rag_extractor.registry import DocumentRegistry
+from rag_api.registry_resolve import resolve_index_db
 
 
 def _apply_storage_root(ns: argparse.Namespace) -> None:
     root = getattr(ns, "storage_root", None)
     if root is not None:
         os.environ["RAG_STORAGE_ROOT"] = str(Path(root).resolve())
-
-
-def _resolve_sha256(reg: DocumentRegistry, key: str) -> str:
-    key = key.strip().lower()
-    if len(key) == 64:
-        return key
-    rows = reg.list_recent(500)
-    matches = [r.content_sha256 for r in rows if r.content_sha256.startswith(key)]
-    if len(matches) == 1:
-        return matches[0]
-    if not matches:
-        raise SystemExit(f"No document matches prefix {key!r}.")
-    raise SystemExit(f"Ambiguous prefix {key!r}: {len(matches)} matches.")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -57,19 +43,16 @@ def main(argv: list[str] | None = None) -> int:
     if not args.query:
         raise SystemExit("Query text required.")
 
-    idx_path: Path | None = args.index
-    if args.sha256:
-        reg = DocumentRegistry()
-        sha = _resolve_sha256(reg, args.sha256)
-        rec = reg.get(sha)
-        if not rec or not rec.index_db_relpath:
-            raise SystemExit("No index in registry for this document.")
-        idx_path = storage_root() / rec.index_db_relpath
-    if idx_path is None:
-        raise SystemExit("Provide --index or --sha256.")
+    try:
+        idx_ref = resolve_index_db(
+            sha256=args.sha256,
+            index_db=str(args.index) if args.index else None,
+        )
+    except ValueError as e:
+        raise SystemExit(str(e)) from e
 
     hits = retrieve(
-        idx_path,
+        idx_ref,
         args.query,
         final_k=args.final_k,
         candidate_pool=max(args.candidate_pool, args.final_k),

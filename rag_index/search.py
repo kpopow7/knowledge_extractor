@@ -9,6 +9,8 @@ import numpy as np
 from rag_index.embeddings import embed_texts
 from rag_index.hybrid import reciprocal_rank_fusion
 from rag_index.store import ChunkIndex
+from rag_index.store_pg import ChunkIndexPostgres
+from rag_index.targets import SearchIndexTarget
 
 
 @dataclass
@@ -18,8 +20,20 @@ class SearchHit:
     payload: dict
 
 
+def _open_index(index_ref: SearchIndexTarget | os.PathLike[str] | str):
+    if isinstance(index_ref, SearchIndexTarget):
+        if index_ref.kind == "postgres":
+            if not index_ref.source_sha256:
+                raise ValueError("postgres index requires source_sha256")
+            return ChunkIndexPostgres(index_ref.source_sha256)
+        if index_ref.sqlite_path is None:
+            raise ValueError("sqlite index requires sqlite_path")
+        return ChunkIndex(Path(index_ref.sqlite_path))
+    return ChunkIndex(Path(index_ref))
+
+
 def search_hybrid(
-    index_db: os.PathLike[str] | str,
+    index_ref: SearchIndexTarget | os.PathLike[str] | str,
     query: str,
     *,
     top_k: int = 15,
@@ -30,12 +44,10 @@ def search_hybrid(
     embedding_model: str | None = None,
 ) -> list[SearchHit]:
     """
-    Dense cosine on normalized vectors + FTS5 BM25, merged with RRF.
+    Dense cosine on normalized vectors + keyword scores, merged with RRF.
     Uses the embedding model recorded in the index unless overridden.
-    If ``candidate_pool`` is set and greater than ``top_k``, returns that many hits
-    (for downstream reranking); otherwise returns ``top_k`` results.
     """
-    idx = ChunkIndex(Path(index_db))
+    idx = _open_index(index_ref)
     model = embedding_model or idx.get_meta("embedding_model")
     ids, mat = idx.load_matrix()
     if not ids or mat.size == 0:

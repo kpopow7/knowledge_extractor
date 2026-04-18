@@ -5,6 +5,7 @@ from pathlib import Path
 
 from rag_eval.schema import EvalCase
 from rag_index.search import SearchHit
+from rag_index.targets import SearchIndexTarget
 from rag_retrieve.pipeline import retrieve
 
 
@@ -39,7 +40,7 @@ def _first_relevant_rank(hits: list[SearchHit], case: EvalCase) -> int | None:
 
 
 def run_evaluation(
-    index_db: Path,
+    index_ref: SearchIndexTarget | Path,
     cases: list[EvalCase],
     *,
     ks: list[int] | None = None,
@@ -57,7 +58,7 @@ def run_evaluation(
 
     for case in cases:
         hits = retrieve(
-            index_db,
+            index_ref,
             case.question,
             final_k=final_k,
             candidate_pool=candidate_pool,

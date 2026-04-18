@@ -1,3 +1,4 @@
+.env
 .venv/
 __pycache__/
 *.pyc
@@ -6,3 +7,4 @@ storage/
 *.egg-info/
 dist/
 build/
+$Recycle.Bin/

@@ -7,6 +7,8 @@ from rag_chunker.models import ChunkRecord
 from rag_index import INDEXER_VERSION
 from rag_index.embeddings import embed_texts
 from rag_index.store import ChunkIndex
+from rag_index.store_pg import ChunkIndexPostgres
+from rag_storage.config import use_postgres
 
 
 def load_chunks_jsonl(path: Path) -> list[ChunkRecord]:
@@ -22,13 +24,14 @@ def load_chunks_jsonl(path: Path) -> list[ChunkRecord]:
 
 def build_index(
     chunks_jsonl: Path,
-    index_db: Path,
+    index_db: Path | None,
     *,
     embedding_model: str | None = None,
     clear: bool = True,
+    postgres_source_sha256: str | None = None,
 ) -> tuple[int, str, int]:
     """
-    Embed `text_embed` for each chunk, write SQLite index + FTS.
+    Embed ``text_embed`` for each chunk, write SQLite index + FTS, or Postgres + pgvector when configured.
     Returns (count, model, dimensions).
     """
     chunks = load_chunks_jsonl(chunks_jsonl)
@@ -38,7 +41,12 @@ def build_index(
     texts = [c.text_embed or c.text_full for c in chunks]
     vectors, model, dims = embed_texts(texts, model=embedding_model)
 
-    idx = ChunkIndex(index_db)
+    if postgres_source_sha256 and use_postgres():
+        idx: ChunkIndex | ChunkIndexPostgres = ChunkIndexPostgres(postgres_source_sha256)
+    else:
+        if index_db is None:
+            raise ValueError("index_db path required when not building Postgres index")
+        idx = ChunkIndex(index_db)
     if clear:
         idx.clear()
 

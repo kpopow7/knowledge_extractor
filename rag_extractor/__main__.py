@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+
+import rag_storage  # noqa: F401 — loads .env for API keys and DATABASE_URL
 import json
 import os
 import sys

@@ -9,8 +9,12 @@ from pathlib import Path
 from rag_index import INDEXER_VERSION
 from rag_index.build import build_index, load_chunks_jsonl
 from rag_index.search import search_hybrid
+from rag_index.store import ChunkIndex
+from rag_index.store_pg import ChunkIndexPostgres
+from rag_index.targets import SearchIndexTarget
 from rag_extractor.paths import index_dir, storage_root
 from rag_extractor.registry import DocumentRegistry
+from rag_storage.config import use_postgres
 
 
 def _apply_storage_root(ns: argparse.Namespace) -> None:
@@ -78,23 +82,36 @@ def main(argv: list[str] | None = None) -> int:
             if not rec.chunks_relpath:
                 raise SystemExit("No chunks.jsonl — run rag_chunker first.")
             if not args.force and rec.index_db_relpath:
-                from rag_index.store import ChunkIndex
-
-                idxp = storage_root() / rec.index_db_relpath
-                if idxp.is_file():
-                    iv = ChunkIndex(idxp).get_meta("indexer_version")
+                if use_postgres() and rec.index_db_relpath == "postgres":
+                    iv = ChunkIndexPostgres(sha).get_meta("indexer_version")
                     if iv == INDEXER_VERSION:
                         print(
                             json.dumps(
                                 {
                                     "skipped": True,
                                     "reason": "index_present_same_indexer_version",
-                                    "index_path": str(idxp),
+                                    "index_path": f"postgres:{sha}",
                                 },
                                 indent=2,
                             )
                         )
                         return 0
+                else:
+                    idxp = storage_root() / rec.index_db_relpath
+                    if idxp.is_file():
+                        iv = ChunkIndex(idxp).get_meta("indexer_version")
+                        if iv == INDEXER_VERSION:
+                            print(
+                                json.dumps(
+                                    {
+                                        "skipped": True,
+                                        "reason": "index_present_same_indexer_version",
+                                        "index_path": str(idxp),
+                                    },
+                                    indent=2,
+                                )
+                            )
+                            return 0
 
             chunks_path = storage_root() / rec.chunks_relpath
 
@@ -110,13 +127,25 @@ def main(argv: list[str] | None = None) -> int:
         else:
             out_db = chunks_path.parent / "index.sqlite"
 
-        n, model, dims = build_index(
-            chunks_path,
-            out_db,
-            embedding_model=args.embedding_model,
-            clear=True,
-        )
-        rel = out_db.resolve().relative_to(storage_root().resolve()).as_posix()
+        if use_postgres() and sha:
+            n, model, dims = build_index(
+                chunks_path,
+                None,
+                embedding_model=args.embedding_model,
+                clear=True,
+                postgres_source_sha256=sha,
+            )
+            rel = "postgres"
+            index_path_display = f"postgres:{sha}"
+        else:
+            n, model, dims = build_index(
+                chunks_path,
+                out_db,
+                embedding_model=args.embedding_model,
+                clear=True,
+            )
+            rel = out_db.resolve().relative_to(storage_root().resolve()).as_posix()
+            index_path_display = str(out_db)
 
         if args.write_registry:
             if sha is None:
@@ -139,7 +168,7 @@ def main(argv: list[str] | None = None) -> int:
                     "chunk_count": n,
                     "embedding_model": model,
                     "dimensions": dims,
-                    "index_path": str(out_db),
+                    "index_path": index_path_display,
                     "index_relpath": rel,
                     "skipped": False,
                 },
@@ -151,18 +180,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "search":
         if not args.query:
             raise SystemExit("Query text required.")
-        idx_path: Path | None = args.index
+        idx_ref: SearchIndexTarget | Path | None = None
         if args.sha256:
             reg = DocumentRegistry()
             sha = _resolve_sha256(reg, args.sha256)
             rec = reg.get(sha)
             if not rec or not rec.index_db_relpath:
                 raise SystemExit("No index in registry for this document.")
-            idx_path = storage_root() / rec.index_db_relpath
-        if idx_path is None:
+            if use_postgres() and rec.index_db_relpath == "postgres":
+                idx_ref = SearchIndexTarget.from_postgres_document(sha)
+            else:
+                idx_ref = SearchIndexTarget.from_sqlite_file(storage_root() / rec.index_db_relpath)
+        elif args.index:
+            idx_ref = SearchIndexTarget.from_sqlite_file(Path(args.index).resolve())
+        if idx_ref is None:
             raise SystemExit("Provide --index or --sha256.")
 
-        hits = search_hybrid(idx_path, args.query, top_k=args.top_k)
+        hits = search_hybrid(idx_ref, args.query, top_k=args.top_k)
         if args.json:
             print(json.dumps([{"chunk_id": h.chunk_id, "rrf": h.rrf_score, **h.payload} for h in hits], indent=2))
         else:

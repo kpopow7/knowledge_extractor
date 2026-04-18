@@ -3,11 +3,12 @@ from __future__ import annotations
 import os
 
 from rag_index.search import SearchHit, search_hybrid
+from rag_index.targets import SearchIndexTarget
 from rag_retrieve.rerankers import Reranker, get_reranker
 
 
 def retrieve(
-    index_db: os.PathLike[str] | str,
+    index_ref: SearchIndexTarget | os.PathLike[str] | str,
     query: str,
     *,
     final_k: int = 10,
@@ -27,7 +28,7 @@ def retrieve(
 
     pool = max(candidate_pool, final_k)
     hits = search_hybrid(
-        index_db,
+        index_ref,
         query,
         top_k=final_k,
         candidate_pool=pool,
