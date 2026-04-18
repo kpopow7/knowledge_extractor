@@ -7,11 +7,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from starlette.middleware.cors import CORSMiddleware
+from starlette.staticfiles import StaticFiles
 
 from rag_api.auth import require_api_key
 from rag_api import job_store
@@ -273,4 +275,18 @@ def get_job_status(
         error_message=rec.error_message,
         created_at=rec.created_at,
         updated_at=rec.updated_at,
+    )
+
+
+_web_dir = Path(__file__).resolve().parent / "web"
+if _web_dir.is_dir():
+
+    @app.get("/")
+    def web_root() -> RedirectResponse:
+        return RedirectResponse(url="/ui/", status_code=302)
+
+    app.mount(
+        "/ui",
+        StaticFiles(directory=str(_web_dir), html=True),
+        name="ui",
     )

@@ -17,6 +17,16 @@ class TestRagApi(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json(), {"status": "ok"})
 
+    def test_web_ui_redirect_and_static(self) -> None:
+        with TestClient(app) as client:
+            r = client.get("/", follow_redirects=False)
+        self.assertEqual(r.status_code, 302)
+        self.assertEqual(r.headers.get("location"), "/ui/")
+        with TestClient(app) as client:
+            r2 = client.get("/ui/")
+        self.assertEqual(r2.status_code, 200)
+        self.assertIn(b"Knowledge RAG", r2.content)
+
     def test_request_id_header(self) -> None:
         with TestClient(app) as client:
             r = client.get("/health", headers={"X-Request-ID": "custom-id"})

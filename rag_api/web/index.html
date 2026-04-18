@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RAG — upload &amp; ask</title>
+  <style>
+    :root {
+      --bg: #f6f7f9;
+      --surface: #fff;
+      --border: #e2e5eb;
+      --text: #1a1d26;
+      --muted: #5c6370;
+      --accent: #2563eb;
+      --accent-hover: #1d4ed8;
+      --danger: #b91c1c;
+      --ok: #15803d;
+      --radius: 10px;
+      --font: ui-sans-serif, system-ui, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    .wrap {
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 1.5rem 1rem 3rem;
+    }
+    h1 {
+      font-size: 1.35rem;
+      font-weight: 600;
+      margin: 0 0 0.25rem;
+    }
+    .sub {
+      color: var(--muted);
+      font-size: 0.9rem;
+      margin-bottom: 1.5rem;
+    }
+    section {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1rem 1.1rem;
+      margin-bottom: 1rem;
+    }
+    section h2 {
+      font-size: 0.85rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+      margin: 0 0 0.75rem;
+      font-weight: 600;
+    }
+    label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 0.35rem; }
+    input[type="text"], input[type="password"] {
+      width: 100%;
+      padding: 0.5rem 0.65rem;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font: inherit;
+    }
+    input[type="file"] { font-size: 0.9rem; }
+    .row { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 0.5rem; }
+    button {
+      font: inherit;
+      cursor: pointer;
+      border: none;
+      border-radius: 6px;
+      padding: 0.45rem 0.9rem;
+      background: var(--accent);
+      color: #fff;
+    }
+    button:hover:not(:disabled) { background: var(--accent-hover); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.secondary { background: var(--surface); color: var(--text); border: 1px solid var(--border); }
+    button.secondary:hover:not(:disabled) { background: var(--bg); }
+    .mono {
+      font-family: ui-monospace, "Cascadia Code", "Segoe UI Mono", monospace;
+      font-size: 0.8rem;
+      word-break: break-all;
+    }
+    .job-panel { min-height: 3rem; }
+    .status-pill {
+      display: inline-block;
+      padding: 0.15rem 0.5rem;
+      border-radius: 999px;
+      font-size: 0.8rem;
+      font-weight: 500;
+    }
+    .status-pill.pending, .status-pill.queued { background: #e0e7ff; color: #3730a3; }
+    .status-pill.ingesting, .status-pill.chunking, .status-pill.indexing { background: #fef3c7; color: #92400e; }
+    .status-pill.ready { background: #dcfce7; color: var(--ok); }
+    .status-pill.failed { background: #fee2e2; color: var(--danger); }
+    .err { color: var(--danger); font-size: 0.9rem; margin-top: 0.5rem; }
+    .chat-log {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      min-height: 200px;
+      max-height: 420px;
+      overflow-y: auto;
+      padding: 0.75rem;
+      background: #fafbfc;
+      margin-bottom: 0.75rem;
+    }
+    .msg { margin-bottom: 0.85rem; }
+    .msg.user .bubble { background: #e8eefc; margin-left: 2rem; }
+    .msg.assistant .bubble { background: #fff; border: 1px solid var(--border); margin-right: 2rem; }
+    .bubble {
+      padding: 0.6rem 0.75rem;
+      border-radius: 8px;
+      white-space: pre-wrap;
+    }
+    .msg .role { font-size: 0.7rem; color: var(--muted); margin-bottom: 0.2rem; }
+    .cites { font-size: 0.75rem; color: var(--muted); margin-top: 0.35rem; }
+    textarea {
+      width: 100%;
+      min-height: 72px;
+      resize: vertical;
+      font: inherit;
+      padding: 0.5rem 0.65rem;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+    }
+    .hint { font-size: 0.8rem; color: var(--muted); margin-top: 0.5rem; }
+    a { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Knowledge RAG</h1>
+    <p class="sub">Upload a PDF, wait for indexing, then ask questions against that document.</p>
+
+    <section>
+      <h2>API access</h2>
+      <label for="apiKey">API key (optional)</label>
+      <input type="password" id="apiKey" autocomplete="off" placeholder="Only if RAG_API_KEYS is set on the server" />
+      <p class="hint">Stored only in this browser (localStorage). Same header as <span class="mono">X-API-Key</span>.</p>
+    </section>
+
+    <section>
+      <h2>1. Upload PDF</h2>
+      <input type="file" id="pdfFile" accept="application/pdf,.pdf" />
+      <div class="row">
+        <button type="button" id="btnUpload">Upload &amp; start job</button>
+        <span id="uploadErr" class="err" style="display:none;"></span>
+      </div>
+    </section>
+
+    <section>
+      <h2>2. Job status</h2>
+      <div class="job-panel" id="jobPanel">
+        <span class="muted">No job yet. Upload a PDF to begin.</span>
+      </div>
+    </section>
+
+    <section>
+      <h2>3. Ask</h2>
+      <p class="hint" id="chatHint">Indexing must finish before you can chat.</p>
+      <div class="chat-log" id="chatLog"></div>
+      <label for="question">Question</label>
+      <textarea id="question" placeholder="Ask something about the uploaded document…" disabled></textarea>
+      <div class="row" style="margin-top:0.5rem;">
+        <button type="button" id="btnAsk" disabled>Send</button>
+      </div>
+      <p id="askErr" class="err" style="display:none;"></p>
+    </section>
+  </div>
+
+  <script>
+(function () {
+  const LS_KEY = "rag_ui_api_key";
+
+  const el = (id) => document.getElementById(id);
+  const apiKeyInput = el("apiKey");
+  const pdfFile = el("pdfFile");
+  const btnUpload = el("btnUpload");
+  const uploadErr = el("uploadErr");
+  const jobPanel = el("jobPanel");
+  const chatHint = el("chatHint");
+  const chatLog = el("chatLog");
+  const question = el("question");
+  const btnAsk = el("btnAsk");
+  const askErr = el("askErr");
+
+  let pollTimer = null;
+  let currentSha256 = null;
+  let currentJobId = null;
+
+  function loadKey() {
+    try {
+      const k = localStorage.getItem(LS_KEY);
+      if (k) apiKeyInput.value = k;
+    } catch (_) {}
+  }
+  function saveKey() {
+    try {
+      const v = apiKeyInput.value.trim();
+      if (v) localStorage.setItem(LS_KEY, v);
+      else localStorage.removeItem(LS_KEY);
+    } catch (_) {}
+  }
+  apiKeyInput.addEventListener("change", saveKey);
+  apiKeyInput.addEventListener("blur", saveKey);
+  loadKey();
+
+  function apiHeaders(json) {
+    const h = {};
+    const k = apiKeyInput.value.trim() || (function () {
+      try { return localStorage.getItem(LS_KEY) || ""; } catch (_) { return ""; }
+    })();
+    if (k) h["X-API-Key"] = k;
+    if (json) h["Content-Type"] = "application/json";
+    return h;
+  }
+
+  async function parseErr(res) {
+    let msg = res.statusText || "Request failed";
+    try {
+      const j = await res.json();
+      if (j && j.detail !== undefined) {
+        msg = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail);
+      }
+    } catch (_) {}
+    return msg;
+  }
+
+  function stopPoll() {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
+
+  function renderJob(job) {
+    const st = job.status || "?";
+    const pill = '<span class="status-pill ' + st + '">' + escapeHtml(st) + "</span>";
+    let body =
+      '<div><strong>Job</strong> <span class="mono">' + escapeHtml(job.job_id) + "</span> " + pill + "</div>";
+    if (job.original_filename) {
+      body += '<div style="margin-top:0.35rem;font-size:0.9rem;">File: ' + escapeHtml(job.original_filename) + "</div>";
+    }
+    if (job.content_sha256) {
+      body += '<div style="margin-top:0.35rem;"><strong>Document id</strong> <span class="mono">' +
+        escapeHtml(job.content_sha256) + "</span></div>";
+    }
+    if (job.skipped && job.reason) {
+      body += '<div class="hint">Skipped: ' + escapeHtml(job.reason) + "</div>";
+    }
+    if (job.error_message) {
+      body += '<div class="err">' + escapeHtml(job.error_message) + "</div>";
+    }
+    jobPanel.innerHTML = body;
+  }
+
+  function escapeHtml(s) {
+    if (s === null || s === undefined) return "";
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  function setChatEnabled(on) {
+    question.disabled = !on;
+    btnAsk.disabled = !on;
+    chatHint.textContent = on
+      ? "Questions use the document id from the job above."
+      : "Indexing must finish before you can chat.";
+  }
+
+  async function pollOnce() {
+    if (!currentJobId) return;
+    const res = await fetch("/v1/jobs/" + encodeURIComponent(currentJobId), {
+      headers: apiHeaders(false),
+    });
+    if (!res.ok) {
+      stopPoll();
+      jobPanel.innerHTML = '<span class="err">' + escapeHtml(await parseErr(res)) + "</span>";
+      return;
+    }
+    const job = await res.json();
+    renderJob(job);
+    if (job.status === "ready" && job.content_sha256) {
+      currentSha256 = job.content_sha256;
+      stopPoll();
+      setChatEnabled(true);
+    } else if (job.status === "failed") {
+      stopPoll();
+      setChatEnabled(false);
+    }
+  }
+
+  function startPoll(jobId) {
+    stopPoll();
+    currentJobId = jobId;
+    currentSha256 = null;
+    setChatEnabled(false);
+    chatLog.innerHTML = "";
+    pollOnce();
+    pollTimer = setInterval(pollOnce, 1000);
+  }
+
+  btnUpload.addEventListener("click", async () => {
+    uploadErr.style.display = "none";
+    askErr.style.display = "none";
+    const f = pdfFile.files && pdfFile.files[0];
+    if (!f) {
+      uploadErr.textContent = "Choose a PDF file first.";
+      uploadErr.style.display = "block";
+      return;
+    }
+    btnUpload.disabled = true;
+    try {
+      const fd = new FormData();
+      fd.append("file", f, f.name);
+      const res = await fetch("/v1/ingest", {
+        method: "POST",
+        headers: apiHeaders(false),
+        body: fd,
+      });
+      if (!res.ok) {
+        uploadErr.textContent = await parseErr(res);
+        uploadErr.style.display = "block";
+        return;
+      }
+      const data = await res.json();
+      startPoll(data.job_id);
+    } catch (e) {
+      uploadErr.textContent = e && e.message ? e.message : String(e);
+      uploadErr.style.display = "block";
+    } finally {
+      btnUpload.disabled = false;
+    }
+  });
+
+  function appendMsg(role, text, cites) {
+    const div = document.createElement("div");
+    div.className = "msg " + role;
+    let citesHtml = "";
+    if (cites && cites.length) {
+      citesHtml = '<div class="cites">Pages: ' + cites.map(function (p) {
+        if (!p || !p.length) return "—";
+        var a = p[0], b = p[1];
+        if (a == null && b == null) return "—";
+        if (b != null && b !== a) return a + "–" + b;
+        return String(a);
+      }).join(", ") + "</div>";
+    }
+    div.innerHTML =
+      '<div class="role">' + (role === "user" ? "You" : "Assistant") + "</div>" +
+      '<div class="bubble">' + escapeHtml(text) + "</div>" + citesHtml;
+    chatLog.appendChild(div);
+    chatLog.scrollTop = chatLog.scrollHeight;
+  }
+
+  btnAsk.addEventListener("click", async () => {
+    askErr.style.display = "none";
+    const q = question.value.trim();
+    if (!q) return;
+    if (!currentSha256) {
+      askErr.textContent = "No document id yet; wait for the job to be ready.";
+      askErr.style.display = "block";
+      return;
+    }
+    btnAsk.disabled = true;
+    appendMsg("user", q, null);
+    question.value = "";
+    try {
+      const res = await fetch("/v1/ask", {
+        method: "POST",
+        headers: apiHeaders(true),
+        body: JSON.stringify({
+          question: q,
+          sha256: currentSha256,
+        }),
+      });
+      if (!res.ok) {
+        const msg = await parseErr(res);
+        askErr.textContent = msg;
+        askErr.style.display = "block";
+        appendMsg("assistant", "(Error: " + msg + ")", null);
+        return;
+      }
+      const data = await res.json();
+      appendMsg("assistant", data.answer || "", data.pages || []);
+    } catch (e) {
+      const msg = e && e.message ? e.message : String(e);
+      askErr.textContent = msg;
+      askErr.style.display = "block";
+      appendMsg("assistant", "(Error: " + msg + ")", null);
+    } finally {
+      btnAsk.disabled = false;
+    }
+  });
+
+  question.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" && !ev.shiftKey) {
+      ev.preventDefault();
+      if (!btnAsk.disabled) btnAsk.click();
+    }
+  });
+})();
+  </script>
+</body>
+</html>
