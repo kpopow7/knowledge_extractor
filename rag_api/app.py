@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import uuid
@@ -7,21 +8,26 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
-from slowapi.util import get_remote_address
 from starlette.middleware.cors import CORSMiddleware
 from starlette.staticfiles import StaticFiles
 
-from rag_api.auth import require_api_key
+from rag_api.auth import AuthContext, require_auth
 from rag_api import job_store
 from rag_api.logging_config import configure_logging
+from rag_api.otel import configure_opentelemetry
+from rag_api.quotas import assert_under_quota, record_success
+from rag_api.rate_limit_key import rate_limit_key
 from rag_api.registry_resolve import resolve_index_db
 from rag_api.request_context import RequestIdMiddleware
+from rag_api.sentry_init import init_sentry
+from rag_api.tenants import reload_registry
 from rag_extractor.paths import storage_root
-from rag_generate.answer import answer_with_retrieval
+from rag_generate.answer import answer_with_retrieval, iter_ask_stream_events, retrieve_timeout_sec
+from rag_generate.budgets import run_with_timeout
 from rag_index.search import SearchHit
 from rag_retrieve.pipeline import retrieve
 from rag_worker.pipeline import run_document_pipeline
@@ -32,12 +38,15 @@ log = logging.getLogger(__name__)
 _rate_limit = os.environ.get("RAG_API_RATE_LIMIT", "120/minute")
 _rate_limit_ingest = os.environ.get("RAG_API_RATE_LIMIT_INGEST", "30/minute")
 
-limiter = Limiter(key_func=get_remote_address)
+limiter = Limiter(key_func=rate_limit_key)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
+    init_sentry()
+    reload_registry()
+    configure_opentelemetry(app)
     log.info("RAG API starting (rate_limit=%s, ingest_limit=%s)", _rate_limit, _rate_limit_ingest)
     yield
     log.info("RAG API shutdown")
@@ -46,7 +55,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Custom knowledge RAG API",
     description="HTTP wrapper around hybrid retrieve and grounded ask (same behavior as CLI).",
-    version="0.3.0",
+    version="0.4.0",
     lifespan=lifespan,
 )
 app.state.limiter = limiter
@@ -139,24 +148,32 @@ def health() -> dict[str, str]:
 def post_retrieve(
     request: Request,
     body: RetrieveBody,
-    _: None = Depends(require_api_key),
+    auth: AuthContext = Depends(require_auth),
 ) -> RetrieveResponse:
+    assert_under_quota(auth, "retrieve")
     try:
         idx = resolve_index_db(sha256=body.sha256, index_db=body.index_db)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     pool = max(body.candidates, body.top)
-    try:
-        hits = retrieve(
+
+    def _do_retrieve() -> list[SearchHit]:
+        return retrieve(
             idx,
             body.query,
             final_k=body.top,
             candidate_pool=pool,
             reranker=body.rerank,
         )
+
+    try:
+        hits = run_with_timeout(_do_retrieve, retrieve_timeout_sec(), label="retrieval")
+    except TimeoutError as e:
+        raise HTTPException(status_code=504, detail=str(e)) from e
     except Exception as e:
         log.exception("retrieve failed")
         raise HTTPException(status_code=500, detail=str(e)) from e
+    record_success(auth, "retrieve")
     return RetrieveResponse(hits=_hits_to_rows(hits))
 
 
@@ -165,8 +182,9 @@ def post_retrieve(
 def post_ask(
     request: Request,
     body: AskBody,
-    _: None = Depends(require_api_key),
+    auth: AuthContext = Depends(require_auth),
 ) -> AskResponse:
+    assert_under_quota(auth, "ask")
     if not os.environ.get("OPENAI_API_KEY"):
         raise HTTPException(
             status_code=503,
@@ -186,6 +204,8 @@ def post_ask(
             candidate_pool=pool,
             reranker=body.rerank,
         )
+    except TimeoutError as e:
+        raise HTTPException(status_code=504, detail=str(e)) from e
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
     except Exception as e:
@@ -194,10 +214,66 @@ def post_ask(
     pages: list[list[int | None]] = [
         [h.payload.get("page_start"), h.payload.get("page_end")] for h in hits
     ]
+    record_success(auth, "ask")
     return AskResponse(
         answer=answer,
         chunk_ids=[h.chunk_id for h in hits],
         pages=pages,
+    )
+
+
+@app.post("/v1/ask/stream")
+@limiter.limit(_rate_limit)
+def post_ask_stream(
+    request: Request,
+    body: AskBody,
+    auth: AuthContext = Depends(require_auth),
+) -> StreamingResponse:
+    """Server-Sent Events (``data:`` JSON lines): ``retrieval``, ``token``, ``done``, or ``error``."""
+    assert_under_quota(auth, "ask")
+    if not os.environ.get("OPENAI_API_KEY"):
+        raise HTTPException(
+            status_code=503,
+            detail="OPENAI_API_KEY is not set; generation is unavailable.",
+        )
+    try:
+        idx = resolve_index_db(sha256=body.sha256, index_db=body.index_db)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    pool = max(body.candidates, body.top)
+
+    def gen():
+        recorded = False
+        try:
+            for ev in iter_ask_stream_events(
+                idx,
+                body.question,
+                chat_model=body.model,
+                final_k=body.top,
+                candidate_pool=pool,
+                reranker=body.rerank,
+            ):
+                if ev.get("type") == "done" and not recorded:
+                    record_success(auth, "ask")
+                    recorded = True
+                line = json.dumps(ev, ensure_ascii=False)
+                yield f"data: {line}\n\n".encode("utf-8")
+        except TimeoutError as e:
+            err = json.dumps({"type": "error", "detail": str(e)}, ensure_ascii=False)
+            yield f"data: {err}\n\n".encode("utf-8")
+        except Exception as e:
+            log.exception("ask stream failed")
+            err = json.dumps({"type": "error", "detail": str(e)}, ensure_ascii=False)
+            yield f"data: {err}\n\n".encode("utf-8")
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
@@ -206,10 +282,11 @@ def post_ask(
 async def post_ingest(
     request: Request,
     background_tasks: BackgroundTasks,
-    _: None = Depends(require_api_key),
+    auth: AuthContext = Depends(require_auth),
     file: UploadFile = File(..., description="PDF bytes (must start with %PDF)"),
     force: bool = False,
 ) -> IngestAcceptedResponse:
+    assert_under_quota(auth, "ingest")
     suffix = Path(file.filename or "upload.pdf").suffix or ".pdf"
     if suffix.lower() != ".pdf":
         raise HTTPException(status_code=400, detail="Filename must end with .pdf")
@@ -252,6 +329,7 @@ async def post_ingest(
         ) from e
 
     log.info("accepted pipeline job %s file=%s redis=%s", job_id, file.filename, use_redis_queue())
+    record_success(auth, "ingest")
     return IngestAcceptedResponse(job_id=job_id, status=out_status)
 
 
@@ -260,7 +338,7 @@ async def post_ingest(
 def get_job_status(
     request: Request,
     job_id: str,
-    _: None = Depends(require_api_key),
+    _auth: AuthContext = Depends(require_auth),
 ) -> JobStatusResponse:
     rec = job_store.get_job(job_id)
     if rec is None:
