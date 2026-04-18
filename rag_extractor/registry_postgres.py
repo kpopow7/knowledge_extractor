@@ -204,3 +204,19 @@ class DocumentRegistryPostgres:
                 )
                 rows = cur.fetchall()
         return [_row_to_record(dict(r)) for r in rows]
+
+    def delete_document(self, content_sha256: str) -> bool:
+        """Remove registry row and Postgres index rows for this document."""
+        rec = self.get(content_sha256)
+        if rec is None:
+            return False
+        from rag_index.store_pg import ChunkIndexPostgres
+
+        ChunkIndexPostgres(content_sha256).clear()
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM documents WHERE content_sha256 = %s",
+                    (content_sha256,),
+                )
+        return True

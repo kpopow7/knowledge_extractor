@@ -53,16 +53,28 @@ def embed_texts(
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not set (or use RAG_INDEX_FAKE_EMBEDDINGS=1).")
 
-    client = OpenAI(api_key=api_key)
-    batch_size = 100
-    all_vecs: list[list[float]] = []
+    from rag_index.embedding_cache import lookup, store
+
     texts_list = list(texts)
-    for i in range(0, len(texts_list), batch_size):
-        batch = texts_list[i : i + batch_size]
-        resp = client.embeddings.create(model=model, input=batch)
-        ordered = sorted(resp.data, key=lambda x: x.index)
-        for item in ordered:
-            all_vecs.append(item.embedding)
+    slots, missing_idx = lookup(model, texts_list)
+    if missing_idx:
+        client = OpenAI(api_key=api_key)
+        batch_size = 100
+        new_texts = [texts_list[i] for i in missing_idx]
+        new_vecs: list[list[float]] = []
+        for i in range(0, len(new_texts), batch_size):
+            batch = new_texts[i : i + batch_size]
+            resp = client.embeddings.create(model=model, input=batch)
+            ordered = sorted(resp.data, key=lambda x: x.index)
+            for item in ordered:
+                new_vecs.append(item.embedding)
+        for j, idx in enumerate(missing_idx):
+            slots[idx] = new_vecs[j]
+        store(model, new_texts, new_vecs)
+
+    all_vecs = [v for v in slots if v is not None]
+    if len(all_vecs) != len(texts_list):
+        raise RuntimeError("embedding cache / API merge produced wrong count")
     dims = len(all_vecs[0]) if all_vecs else 0
     return all_vecs, model, dims
 

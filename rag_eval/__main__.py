@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from rag_api.registry_resolve import resolve_index_db
+from rag_eval.gate import run_gate
 from rag_eval.runner import load_cases, metrics_to_json, run_evaluation
 
 
@@ -30,10 +31,26 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--per-case", type=Path, help="Write per-case JSON lines here")
     run.add_argument("--storage-root", type=Path, default=None)
 
+    gate = sub.add_parser(
+        "gate",
+        help="Build index from workspace/chunks.jsonl, run cases, enforce thresholds (CI).",
+    )
+    gate.add_argument(
+        "--workspace",
+        type=Path,
+        required=True,
+        help="Directory containing chunks.jsonl, cases.jsonl, thresholds.json",
+    )
+    gate.add_argument("--ks", default="1,5,10", help="Comma-separated k for recall@k checks")
+    gate.add_argument("--storage-root", type=Path, default=None)
+
     args = p.parse_args(argv)
     _apply_storage_root(args)
 
     ks = [int(x.strip()) for x in args.ks.split(",") if x.strip()]
+
+    if args.cmd == "gate":
+        return run_gate(args.workspace, ks=ks)
 
     if args.cmd != "run":
         return 1

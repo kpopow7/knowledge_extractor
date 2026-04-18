@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -15,8 +16,10 @@ from slowapi.errors import RateLimitExceeded
 from starlette.middleware.cors import CORSMiddleware
 from starlette.staticfiles import StaticFiles
 
+from rag_api.admin_auth import require_admin
 from rag_api.auth import AuthContext, require_auth
 from rag_api import job_store
+from rag_api.job_store import IngestJobRecord
 from rag_api.logging_config import configure_logging
 from rag_api.otel import configure_opentelemetry
 from rag_api.quotas import assert_under_quota, record_success
@@ -26,17 +29,20 @@ from rag_api.request_context import RequestIdMiddleware
 from rag_api.sentry_init import init_sentry
 from rag_api.tenants import reload_registry
 from rag_extractor.paths import storage_root
+from rag_extractor.registry import DocumentRegistry
 from rag_generate.answer import answer_with_retrieval, iter_ask_stream_events, retrieve_timeout_sec
 from rag_generate.budgets import run_with_timeout
 from rag_index.search import SearchHit
 from rag_retrieve.pipeline import retrieve
-from rag_worker.pipeline import run_document_pipeline
+from rag_worker.pipeline import run_document_pipeline, run_index_for_sha256
 from rag_worker.queue import enqueue_document_job, use_redis_queue
 
 log = logging.getLogger(__name__)
 
 _rate_limit = os.environ.get("RAG_API_RATE_LIMIT", "120/minute")
 _rate_limit_ingest = os.environ.get("RAG_API_RATE_LIMIT_INGEST", "30/minute")
+_admin_rate_limit = os.environ.get("RAG_ADMIN_RATE_LIMIT", "30/minute")
+_SHA256_HEX = re.compile(r"^[0-9a-fA-F]{64}$")
 
 limiter = Limiter(key_func=rate_limit_key)
 
@@ -136,6 +142,24 @@ class JobStatusResponse(BaseModel):
     error_message: str | None = None
     created_at: str
     updated_at: str
+
+
+class AdminJobListResponse(BaseModel):
+    jobs: list[JobStatusResponse]
+
+
+def _job_record_to_status(r: IngestJobRecord) -> JobStatusResponse:
+    return JobStatusResponse(
+        job_id=r.job_id,
+        status=r.status,
+        original_filename=r.original_filename,
+        content_sha256=r.content_sha256,
+        skipped=r.skipped,
+        reason=r.reason,
+        error_message=r.error_message,
+        created_at=r.created_at,
+        updated_at=r.updated_at,
+    )
 
 
 @app.get("/health")
@@ -354,6 +378,57 @@ def get_job_status(
         created_at=rec.created_at,
         updated_at=rec.updated_at,
     )
+
+
+@app.get("/v1/admin/jobs", response_model=AdminJobListResponse)
+@limiter.limit(_admin_rate_limit)
+def admin_list_jobs(
+    request: Request,
+    limit: int = 100,
+    offset: int = 0,
+    _: None = Depends(require_admin),
+) -> AdminJobListResponse:
+    rows = job_store.list_jobs(limit=limit, offset=offset)
+    return AdminJobListResponse(jobs=[_job_record_to_status(r) for r in rows])
+
+
+@app.delete("/v1/admin/documents/{content_sha256}")
+@limiter.limit(_admin_rate_limit)
+def admin_delete_document(
+    request: Request,
+    content_sha256: str,
+    _: None = Depends(require_admin),
+) -> dict[str, str | bool]:
+    if not _SHA256_HEX.match(content_sha256):
+        raise HTTPException(status_code=400, detail="content_sha256 must be 64 hex chars")
+    content_sha256 = content_sha256.lower()
+    reg = DocumentRegistry()
+    if not reg.delete_document(content_sha256):
+        raise HTTPException(status_code=404, detail="Unknown document")
+    return {"deleted": True, "content_sha256": content_sha256}
+
+
+@app.post("/v1/admin/documents/{content_sha256}/reindex")
+@limiter.limit(_admin_rate_limit)
+def admin_reindex_document(
+    request: Request,
+    content_sha256: str,
+    _: None = Depends(require_admin),
+    force: bool = False,
+) -> dict[str, str | bool]:
+    if not _SHA256_HEX.match(content_sha256):
+        raise HTTPException(status_code=400, detail="content_sha256 must be 64 hex chars")
+    content_sha256 = content_sha256.lower()
+    reg = DocumentRegistry()
+    if reg.get(content_sha256) is None:
+        raise HTTPException(status_code=404, detail="Unknown document")
+    embedding_model = os.environ.get("OPENAI_EMBEDDING_MODEL")
+    try:
+        run_index_for_sha256(content_sha256, embedding_model=embedding_model, force=force)
+    except Exception as e:
+        log.exception("admin reindex failed")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return {"reindexed": True, "content_sha256": content_sha256, "force": force}
 
 
 _web_dir = Path(__file__).resolve().parent / "web"

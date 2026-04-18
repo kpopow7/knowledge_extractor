@@ -1,0 +1,2 @@
+{"id":"ci_q1","question":"ci_gate_alpha_token unique phrase","gold_substrings":["ci_gate_alpha_token"]}
+{"id":"ci_q2","question":"ci_gate_beta_token second","gold_substrings":["ci_gate_beta_token"]}

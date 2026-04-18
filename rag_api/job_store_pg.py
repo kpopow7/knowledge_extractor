@@ -85,3 +85,36 @@ def get_job(job_id: str):
         created_at=str(d["created_at"]),
         updated_at=str(d["updated_at"]),
     )
+
+
+def list_jobs(limit: int = 100, offset: int = 0):
+    from rag_api.job_store import IngestJobRecord
+
+    init_schema()
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    with connect() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM ingest_jobs ORDER BY updated_at DESC LIMIT %s OFFSET %s",
+                (limit, offset),
+            )
+            rows = cur.fetchall()
+    out: list[IngestJobRecord] = []
+    for r in rows:
+        d = dict(r)
+        skipped = d.get("skipped")
+        out.append(
+            IngestJobRecord(
+                job_id=d["job_id"],
+                status=d["status"],
+                original_filename=d.get("original_filename"),
+                content_sha256=d.get("content_sha256"),
+                skipped=None if skipped is None else bool(skipped),
+                reason=d.get("reason"),
+                error_message=d.get("error_message"),
+                created_at=str(d["created_at"]),
+                updated_at=str(d["updated_at"]),
+            )
+        )
+    return out

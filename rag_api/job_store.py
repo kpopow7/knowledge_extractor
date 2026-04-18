@@ -162,3 +162,34 @@ def get_job(job_id: str) -> IngestJobRecord | None:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
+
+
+def list_jobs(limit: int = 100, offset: int = 0) -> list[IngestJobRecord]:
+    if use_postgres():
+        from rag_api import job_store_pg
+
+        return job_store_pg.list_jobs(limit=limit, offset=offset)
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM ingest_jobs ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()
+    out: list[IngestJobRecord] = []
+    for row in rows:
+        skipped = row["skipped"]
+        out.append(
+            IngestJobRecord(
+                job_id=row["job_id"],
+                status=row["status"],
+                original_filename=row["original_filename"],
+                content_sha256=row["content_sha256"],
+                skipped=None if skipped is None else bool(skipped),
+                reason=row["reason"],
+                error_message=row["error_message"],
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+            )
+        )
+    return out

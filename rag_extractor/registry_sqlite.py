@@ -3,10 +3,11 @@ from __future__ import annotations
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import shutil
 from pathlib import Path
 from typing import Iterator
 
-from rag_extractor.paths import registry_db_path
+from rag_extractor.paths import documents_dir, index_dir, registry_db_path, storage_root
 from rag_extractor.registry_models import DocumentRecord
 
 
@@ -226,6 +227,29 @@ class DocumentRegistrySqlite:
                 (limit,),
             ).fetchall()
         return [self._row_to_record(r) for r in rows]
+
+    def delete_document(self, content_sha256: str) -> bool:
+        """Remove registry row and on-disk artifacts for this document (SQLite index)."""
+        rec = self.get(content_sha256)
+        if rec is None:
+            return False
+        root = storage_root()
+        with self._conn() as conn:
+            conn.execute("DELETE FROM documents WHERE content_sha256 = ?", (content_sha256,))
+        doc_dir = documents_dir() / content_sha256
+        if doc_dir.is_dir():
+            shutil.rmtree(doc_dir, ignore_errors=True)
+        idxp = index_dir() / f"{content_sha256}.sqlite"
+        if idxp.is_file():
+            idxp.unlink(missing_ok=True)
+        if rec.source_relpath:
+            p = root / rec.source_relpath
+            if p.is_file():
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+        return True
 
     @staticmethod
     def _row_to_record(row: sqlite3.Row) -> DocumentRecord:
