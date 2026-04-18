@@ -104,3 +104,4 @@ def init_schema() -> None:
             )
             """
         )
+        conn.execute("ALTER TABLE ingest_jobs ADD COLUMN IF NOT EXISTS tenant_id TEXT")

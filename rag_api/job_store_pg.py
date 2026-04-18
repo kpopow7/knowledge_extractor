@@ -11,7 +11,7 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def create_job(job_id: str, original_filename: str) -> None:
+def create_job(job_id: str, original_filename: str, *, tenant_id: str | None = None) -> None:
     init_schema()
     now = _utc_now()
     with connect() as conn:
@@ -19,10 +19,10 @@ def create_job(job_id: str, original_filename: str) -> None:
             cur.execute(
                 """
                 INSERT INTO ingest_jobs (
-                  job_id, status, original_filename, content_sha256, skipped, reason, error_message, created_at, updated_at
-                ) VALUES (%s, 'pending', %s, NULL, NULL, NULL, NULL, %s, %s)
+                  job_id, status, original_filename, content_sha256, skipped, reason, error_message, created_at, updated_at, tenant_id
+                ) VALUES (%s, 'pending', %s, NULL, NULL, NULL, NULL, %s, %s, %s)
                 """,
-                (job_id, original_filename, now, now),
+                (job_id, original_filename, now, now, tenant_id),
             )
 
 
@@ -84,6 +84,7 @@ def get_job(job_id: str):
         error_message=d.get("error_message"),
         created_at=str(d["created_at"]),
         updated_at=str(d["updated_at"]),
+        tenant_id=d.get("tenant_id"),
     )
 
 
@@ -115,6 +116,28 @@ def list_jobs(limit: int = 100, offset: int = 0):
                 error_message=d.get("error_message"),
                 created_at=str(d["created_at"]),
                 updated_at=str(d["updated_at"]),
+                tenant_id=d.get("tenant_id"),
             )
         )
     return out
+
+
+def list_tenant_document_shas(tenant_id: str, *, limit: int = 50, offset: int = 0) -> list[str]:
+    init_schema()
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    with connect() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT content_sha256, MAX(updated_at) AS lu
+                FROM ingest_jobs
+                WHERE tenant_id = %s AND content_sha256 IS NOT NULL
+                GROUP BY content_sha256
+                ORDER BY lu DESC
+                LIMIT %s OFFSET %s
+                """,
+                (tenant_id, limit, offset),
+            )
+            rows = cur.fetchall()
+    return [str(r["content_sha256"]) for r in rows]

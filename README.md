@@ -43,7 +43,7 @@ Use this as a checklist. Items marked **Done** reflect the repository today; oth
   - **`rag_eval`** — eval cases as **JSONL** (`EvalCase`: `id`, `question`, optional `gold_chunk_ids`, `gold_pages`, `gold_substrings`); reports **MRR** and **recall@k**.
 - **Phase 5 (generate — entry):**
   - **`rag_generate ask`** — runs **`retrieve`** (same `--rerank` / pool flags), builds a context block from hits, calls **OpenAI Chat Completions** (`OPENAI_API_KEY`, optional `OPENAI_CHAT_MODEL`, default `gpt-4o-mini`).
-- **HTTP API (`rag_api`) + workers (`rag_worker`):** **FastAPI** — **`GET /health`**, **`GET /metrics`** (Prometheus, optional), **`POST /v1/retrieve`**, **`POST /v1/ask`**, **`POST /v1/ask/stream`** (SSE: `retrieval` / `token` / `done` / `error` events), **`POST /v1/ingest`** (full pipeline **ingest → chunk → embed/index**), **`GET /v1/jobs/{job_id}`**; uploads under **`storage/incoming/`** then **`REDIS_URL`** + **RQ worker** or **`BackgroundTasks`** when Redis unset; optional **`RAG_API_KEYS`** and/or **`RAG_TENANTS_FILE`**, CORS, rate limits (keyed by **tenant** when a valid API key maps to a tenant), **`X-Request-ID`**; **admin** API (**`RAG_ADMIN_API_KEYS`**): list jobs, delete document, reindex. **Retrieve/ask timeouts** return **504** when budgets are exceeded.
+- **HTTP API (`rag_api`) + workers (`rag_worker`):** **FastAPI** — **`GET /health`**, **`GET /metrics`** (Prometheus, optional), **`GET /v1/documents`** (registry list: **tenant-scoped** when authenticated via **`POST /v1/ingest`** jobs, else recent rows in open mode), **`POST /v1/retrieve`**, **`POST /v1/ask`**, **`POST /v1/ask/stream`** (SSE: `retrieval` / `token` / `done` / `error` events), **`POST /v1/ingest`** (stores **`tenant_id`** on the job row), **`GET /v1/jobs/{job_id}`**; uploads under **`storage/incoming/`** then **`REDIS_URL`** + **RQ worker** or **`BackgroundTasks`** when Redis unset; optional **`RAG_API_KEYS`** and/or **`RAG_TENANTS_FILE`**, CORS, rate limits (keyed by **tenant** when a valid API key maps to a tenant), **`X-Request-ID`**; **admin** API (**`RAG_ADMIN_API_KEYS`**): list jobs, delete document, **reindex**, **rechunk**, **reprocess** (extract→chunk→index from stored PDF). **Retrieve/ask timeouts** return **504** when budgets are exceeded.
 - **Web UI:** **`GET /`** redirects to **`/ui/`** — minimal single-page app: PDF upload, job polling, chat using **`/v1/ask/stream`** (same-origin; optional **`X-API-Key`** stored in `localStorage`).
 - **Observability:** optional **OTLP** traces (**`OTEL_EXPORTER_OTLP_ENDPOINT`**), **Sentry** (**`SENTRY_DSN`**), **Prometheus** scrape target **`GET /metrics`**.
 - **Embeddings:** optional on-disk cache when **`RAG_EMBEDDING_CACHE=1`** (`storage/cache/embedding_cache.sqlite`); never used for fake embeddings.
@@ -68,7 +68,7 @@ Use this as a checklist. Items marked **Done** reflect the repository today; oth
 | `rag_storage/` | Postgres schema/init, S3/local **blob** helpers, config |
 | `fixtures/eval/` | Example eval JSONL (lines starting with `#` are ignored); **`ci/`** — fixed **chunks.jsonl** / **cases.jsonl** / **thresholds.json** for the **`rag_eval gate`** command |
 | `fixtures/pdfs/` | Example PDFs for local testing (optional; add your own) |
-| `storage/` | `registry.db`, `api_jobs.sqlite` (job rows), `tenant_usage.sqlite` (daily quota counters), `cache/embedding_cache.sqlite` (if **`RAG_EMBEDDING_CACHE=1`**), `incoming/` (uploaded PDFs awaiting processing), `documents/<sha256>/`, `index/<sha256>.sqlite`, optional `artifacts/` (**gitignored**) |
+| `storage/` | `registry.db`, `api_jobs.sqlite` (job rows + optional **`tenant_id`** per ingest), `tenant_usage.sqlite` (daily quota counters), `cache/embedding_cache.sqlite` (if **`RAG_EMBEDDING_CACHE=1`**), `incoming/` (uploaded PDFs awaiting processing), `documents/<sha256>/`, `index/<sha256>.sqlite`, optional `artifacts/` (**gitignored**) |
 | `.github/workflows/` | **CI** (unit tests + **`rag_eval gate`**) |
 | `tests/` | Unit/smoke tests |
 | `requirements.txt` | Python dependencies |
@@ -144,7 +144,7 @@ Copy [`.env.example`](.env.example) to **`.env`** in the project root and set se
 | `RAG_API_PORT` | HTTP API port (default `8000`) |
 | `RAG_API_KEYS` | Optional comma-separated API keys. If set (or if **`RAG_TENANTS_FILE`** is set), **`/v1/*`** requires **`X-API-Key: <key>`** or **`Authorization: Bearer <key>`** ( **`/health`**, **`/metrics`**, and the static **`/ui`** assets stay open without a key). |
 | `RAG_API_CORS_ORIGINS` | Optional comma-separated allowed browser origins (enables CORS when non-empty). |
-| `RAG_API_RATE_LIMIT` | SlowAPI limit for **`/v1/retrieve`**, **`/v1/ask`**, **`/v1/ask/stream`**, **`GET /v1/jobs/...`** (default `120/minute`; keyed by **tenant** when the API key maps to a tenant, else **client IP**). |
+| `RAG_API_RATE_LIMIT` | SlowAPI limit for **`/v1/retrieve`**, **`/v1/ask`**, **`/v1/ask/stream`**, **`GET /v1/jobs/...`**, **`GET /v1/documents`** (default `120/minute`; keyed by **tenant** when the API key maps to a tenant, else **client IP**). |
 | `RAG_API_RATE_LIMIT_INGEST` | Limit for **`POST /v1/ingest`** (default `30/minute`). |
 | `RAG_API_LOG_LEVEL` | Root/uvicorn log level (default `INFO`). |
 | `REDIS_URL` | If set (e.g. `redis://localhost:6379/0`), **`POST /v1/ingest`** enqueues work on queue **`rag`**; run **`python -m rag_worker.worker`** (or the **worker** service in Docker). If unset, the pipeline runs in **`BackgroundTasks`** in the API process (dev-friendly; not for multi-replica APIs). |
@@ -208,14 +208,17 @@ python -m rag_api --host 127.0.0.1 --port 8000
 | `GET` | `/metrics` | **Prometheus** text exposition (HTTP request metrics + process). Omit if **`RAG_PROMETHEUS_METRICS=0`** or exporter not installed. |
 | `GET` | `/` | **302** redirect to **`/ui/`** when the bundled web UI is present. |
 | `GET` | `/ui/` | Static **web UI** (upload PDF → poll jobs → chat). |
+| `GET` | `/v1/documents` | Query: **`limit`**, **`offset`**. **Open mode** (no API keys): recent registry documents. **With API key**: distinct **`content_sha256`** from **ingest jobs** for your **`tenant_id`** (from **`RAG_TENANTS_FILE`** or **`default`** for flat **`RAG_API_KEYS`**). CLI-ingested docs (no job row) appear only in open mode. |
 | `POST` | `/v1/retrieve` | JSON: **`query`** (required); **`sha256`** (registry id or prefix) *or* **`index_db`** (path to index SQLite); optional **`top`**, **`candidates`**, **`rerank`**. Response: **`hits`**. Subject to retrieve timeout → **504**. |
 | `POST` | `/v1/ask` | JSON: **`question`** (required); **`sha256`** or **`index_db`**; optional **`model`**, **`top`**, **`candidates`**, **`rerank`**. Response: **`answer`**, **`chunk_ids`**, **`pages`**. Subject to ask budget → **504**. |
 | `POST` | `/v1/ask/stream` | Same JSON as **`/v1/ask`**. Response: **`text/event-stream`** with **`data:`** JSON lines: **`type`**: `retrieval` (chunk ids + pages), `token` (delta text), `done`, or `error`. |
 | `POST` | `/v1/ingest` | **Multipart** **`file`**: PDF only (must begin with **`%PDF`**); optional query **`force=true`**. Returns **`202`** with **`job_id`** and **`status`**: **`queued`** (Redis) or **`pending`** (in-process). Runs **ingest → chunk → index**; poll until **`ready`** before **`/v1/retrieve`** / **`/v1/ask`**. |
-| `GET` | `/v1/jobs/{job_id}` | Poll job status: **`pending`**, **`queued`**, **`ingesting`**, **`chunking`**, **`indexing`**, **`ready`**, **`failed`**; includes **`content_sha256`** and **`error_message`** when known. |
+| `GET` | `/v1/jobs/{job_id}` | Poll job status: **`pending`**, **`queued`**, **`ingesting`**, **`chunking`**, **`indexing`**, **`ready`**, **`failed`**; includes **`content_sha256`**, optional **`tenant_id`**, and **`error_message`** when known. |
 | `GET` | `/v1/admin/jobs` | Query: **`limit`**, **`offset`**. Lists ingest jobs (newest first). Requires **admin** key. |
 | `DELETE` | `/v1/admin/documents/{sha256}` | Deletes registry row and on-disk artifacts (SQLite index file, **`documents/<sha>/`**, source PDF when under storage). Requires **admin** key. |
 | `POST` | `/v1/admin/documents/{sha256}/reindex` | Query: **`force`**. Rebuilds the vector index for an existing chunked document. Requires **admin** key. |
+| `POST` | `/v1/admin/documents/{sha256}/rechunk` | Query: **`force`**. Rebuilds **`chunks.jsonl`** from **`extraction.json`**. Requires **admin** key. |
+| `POST` | `/v1/admin/documents/{sha256}/reprocess` | Query: **`force`**. Re-runs **extract → chunk → index** using the stored **`source.pdf`** (**409** if the file is missing on disk). Requires **admin** key. |
 
 **Quota exceeded:** **`429`** when the tenant’s daily cap is reached for ask / retrieve / ingest.
 

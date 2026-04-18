@@ -45,6 +45,7 @@ class IngestJobRecord:
     error_message: str | None
     created_at: str
     updated_at: str
+    tenant_id: str | None = None
 
 
 @contextmanager
@@ -69,23 +70,42 @@ def _migrate(conn: sqlite3.Connection) -> None:
     conn.execute(
         "UPDATE ingest_jobs SET status = 'ingesting' WHERE status = 'running'",
     )
+    if "tenant_id" not in cols:
+        conn.execute("ALTER TABLE ingest_jobs ADD COLUMN tenant_id TEXT")
 
 
-def create_job(job_id: str, original_filename: str) -> None:
+def _row_to_record(row: sqlite3.Row) -> IngestJobRecord:
+    skipped = row["skipped"]
+    tid = row["tenant_id"] if "tenant_id" in row.keys() else None
+    return IngestJobRecord(
+        job_id=row["job_id"],
+        status=row["status"],
+        original_filename=row["original_filename"],
+        content_sha256=row["content_sha256"],
+        skipped=None if skipped is None else bool(skipped),
+        reason=row["reason"],
+        error_message=row["error_message"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        tenant_id=tid,
+    )
+
+
+def create_job(job_id: str, original_filename: str, *, tenant_id: str | None = None) -> None:
     if use_postgres():
         from rag_api import job_store_pg
 
-        job_store_pg.create_job(job_id, original_filename)
+        job_store_pg.create_job(job_id, original_filename, tenant_id=tenant_id)
         return
     now = _utc_now()
     with _connect() as conn:
         conn.execute(
             """
             INSERT INTO ingest_jobs (
-              job_id, status, original_filename, content_sha256, skipped, reason, error_message, created_at, updated_at
-            ) VALUES (?, 'pending', ?, NULL, NULL, NULL, NULL, ?, ?)
+              job_id, status, original_filename, content_sha256, skipped, reason, error_message, created_at, updated_at, tenant_id
+            ) VALUES (?, 'pending', ?, NULL, NULL, NULL, NULL, ?, ?, ?)
             """,
-            (job_id, original_filename, now, now),
+            (job_id, original_filename, now, now, tenant_id),
         )
 
 
@@ -150,18 +170,7 @@ def get_job(job_id: str) -> IngestJobRecord | None:
         row = conn.execute("SELECT * FROM ingest_jobs WHERE job_id = ?", (job_id,)).fetchone()
     if row is None:
         return None
-    skipped = row["skipped"]
-    return IngestJobRecord(
-        job_id=row["job_id"],
-        status=row["status"],
-        original_filename=row["original_filename"],
-        content_sha256=row["content_sha256"],
-        skipped=None if skipped is None else bool(skipped),
-        reason=row["reason"],
-        error_message=row["error_message"],
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
-    )
+    return _row_to_record(row)
 
 
 def list_jobs(limit: int = 100, offset: int = 0) -> list[IngestJobRecord]:
@@ -176,20 +185,30 @@ def list_jobs(limit: int = 100, offset: int = 0) -> list[IngestJobRecord]:
             "SELECT * FROM ingest_jobs ORDER BY updated_at DESC LIMIT ? OFFSET ?",
             (limit, offset),
         ).fetchall()
-    out: list[IngestJobRecord] = []
-    for row in rows:
-        skipped = row["skipped"]
-        out.append(
-            IngestJobRecord(
-                job_id=row["job_id"],
-                status=row["status"],
-                original_filename=row["original_filename"],
-                content_sha256=row["content_sha256"],
-                skipped=None if skipped is None else bool(skipped),
-                reason=row["reason"],
-                error_message=row["error_message"],
-                created_at=row["created_at"],
-                updated_at=row["updated_at"],
-            )
-        )
-    return out
+    return [_row_to_record(row) for row in rows]
+
+
+def list_tenant_document_shas(tenant_id: str, *, limit: int = 50, offset: int = 0) -> list[str]:
+    """
+    Distinct ``content_sha256`` values from ingest jobs for this tenant (API uploads only),
+    newest activity first.
+    """
+    if use_postgres():
+        from rag_api import job_store_pg
+
+        return job_store_pg.list_tenant_document_shas(tenant_id, limit=limit, offset=offset)
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT content_sha256, MAX(updated_at) AS lu
+            FROM ingest_jobs
+            WHERE tenant_id = ? AND content_sha256 IS NOT NULL
+            GROUP BY content_sha256
+            ORDER BY lu DESC
+            LIMIT ? OFFSET ?
+            """,
+            (tenant_id, limit, offset),
+        ).fetchall()
+    return [str(r["content_sha256"]) for r in rows]

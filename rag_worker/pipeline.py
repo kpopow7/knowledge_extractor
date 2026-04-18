@@ -186,3 +186,32 @@ def run_document_pipeline(job_id: str, temp_pdf: Path, *, force: bool) -> None:
     except Exception as e:  # noqa: BLE001
         log.exception("pipeline job %s failed", job_id)
         job_store.set_status(job_id, "failed", error_message=f"{type(e).__name__}: {e}")
+
+
+def run_reprocess_for_sha256(content_sha256: str, *, force: bool) -> dict[str, Any]:
+    """
+    Re-run extraction from the stored ``source.pdf``, then chunk and index (admin maintenance).
+    Requires the document registry row and on-disk source at ``source_relpath``.
+    """
+    reg = DocumentRegistry()
+    rec = reg.get(content_sha256)
+    if rec is None:
+        raise RuntimeError("Document not in registry.")
+    src = storage_root() / rec.source_relpath
+    if not src.is_file():
+        raise RuntimeError(f"Source PDF missing at {rec.source_relpath}")
+
+    embedding_model = os.environ.get("OPENAI_EMBEDDING_MODEL")
+    result = ingest_pdf(src, force=force)
+    if result.status == "failed":
+        raise RuntimeError("Re-ingest (extract) failed; check registry error_message.")
+
+    sha = result.content_sha256
+    chunk_out = run_chunk_for_sha256(sha, force=force)
+    index_out = run_index_for_sha256(sha, embedding_model=embedding_model, force=force)
+    return {
+        "content_sha256": sha,
+        "ingest": {"skipped": result.skipped, "reason": result.reason},
+        "chunk": chunk_out,
+        "index": index_out,
+    }

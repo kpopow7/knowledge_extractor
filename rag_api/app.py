@@ -30,12 +30,17 @@ from rag_api.request_context import RequestIdMiddleware
 from rag_api.sentry_init import init_sentry
 from rag_api.tenants import reload_registry
 from rag_extractor.paths import storage_root
-from rag_extractor.registry import DocumentRegistry
+from rag_extractor.registry import DocumentRecord, DocumentRegistry
 from rag_generate.answer import answer_with_retrieval, iter_ask_stream_events, retrieve_timeout_sec
 from rag_generate.budgets import run_with_timeout
 from rag_index.search import SearchHit
 from rag_retrieve.pipeline import retrieve
-from rag_worker.pipeline import run_document_pipeline, run_index_for_sha256
+from rag_worker.pipeline import (
+    run_chunk_for_sha256,
+    run_document_pipeline,
+    run_index_for_sha256,
+    run_reprocess_for_sha256,
+)
 from rag_worker.queue import enqueue_document_job, use_redis_queue
 
 log = logging.getLogger(__name__)
@@ -143,6 +148,22 @@ class JobStatusResponse(BaseModel):
     error_message: str | None = None
     created_at: str
     updated_at: str
+    tenant_id: str | None = None
+
+
+class DocumentSummary(BaseModel):
+    """One row in ``GET /v1/documents`` (registry + index hint)."""
+
+    content_sha256: str
+    original_filename: str | None = None
+    status: str
+    page_count: int | None = None
+    has_index: bool = Field(description="True when registry has an index reference")
+    updated_at: str
+
+
+class DocumentListResponse(BaseModel):
+    documents: list[DocumentSummary]
 
 
 class AdminJobListResponse(BaseModel):
@@ -160,12 +181,55 @@ def _job_record_to_status(r: IngestJobRecord) -> JobStatusResponse:
         error_message=r.error_message,
         created_at=r.created_at,
         updated_at=r.updated_at,
+        tenant_id=r.tenant_id,
+    )
+
+
+def _record_to_summary(rec: DocumentRecord) -> DocumentSummary:
+    return DocumentSummary(
+        content_sha256=rec.content_sha256,
+        original_filename=rec.original_filename,
+        status=rec.status,
+        page_count=rec.page_count,
+        has_index=bool(rec.index_db_relpath),
+        updated_at=rec.updated_at,
     )
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/v1/documents", response_model=DocumentListResponse)
+@limiter.limit(_rate_limit)
+def list_documents(
+    request: Request,
+    auth: AuthContext = Depends(require_auth),
+    limit: int = 50,
+    offset: int = 0,
+) -> DocumentListResponse:
+    """
+    List documents visible to the caller. **Open mode** (no API keys): recent registry rows.
+    **Authenticated**: only ``content_sha256`` values tied to this tenant via **`POST /v1/ingest`**
+    (jobs store ``tenant_id``).
+    """
+    reg = DocumentRegistry()
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    if auth.anonymous:
+        rows = reg.list_recent(limit=limit + offset)
+        slice_rows = rows[offset : offset + limit]
+        return DocumentListResponse(documents=[_record_to_summary(r) for r in slice_rows])
+    if auth.tenant is None:
+        raise HTTPException(status_code=401, detail="Authentication required to list tenant documents")
+    shas = job_store.list_tenant_document_shas(auth.tenant.tenant_id, limit=limit, offset=offset)
+    out: list[DocumentSummary] = []
+    for sha in shas:
+        rec = reg.get(sha)
+        if rec is not None:
+            out.append(_record_to_summary(rec))
+    return DocumentListResponse(documents=out)
 
 
 @app.post("/v1/retrieve", response_model=RetrieveResponse)
@@ -336,7 +400,8 @@ async def post_ingest(
         dest.unlink(missing_ok=True)
         raise
 
-    job_store.create_job(job_id, file.filename or "upload.pdf")
+    tenant_id = None if auth.anonymous else (auth.tenant.tenant_id if auth.tenant else None)
+    job_store.create_job(job_id, file.filename or "upload.pdf", tenant_id=tenant_id)
     try:
         if use_redis_queue():
             enqueue_document_job(job_id, dest, force=force)
@@ -368,17 +433,7 @@ def get_job_status(
     rec = job_store.get_job(job_id)
     if rec is None:
         raise HTTPException(status_code=404, detail="Unknown job_id")
-    return JobStatusResponse(
-        job_id=rec.job_id,
-        status=rec.status,
-        original_filename=rec.original_filename,
-        content_sha256=rec.content_sha256,
-        skipped=rec.skipped,
-        reason=rec.reason,
-        error_message=rec.error_message,
-        created_at=rec.created_at,
-        updated_at=rec.updated_at,
-    )
+    return _job_record_to_status(rec)
 
 
 @app.get("/v1/admin/jobs", response_model=AdminJobListResponse)
@@ -430,6 +485,56 @@ def admin_reindex_document(
         log.exception("admin reindex failed")
         raise HTTPException(status_code=500, detail=str(e)) from e
     return {"reindexed": True, "content_sha256": content_sha256, "force": force}
+
+
+@app.post("/v1/admin/documents/{content_sha256}/rechunk")
+@limiter.limit(_admin_rate_limit)
+def admin_rechunk_document(
+    request: Request,
+    content_sha256: str,
+    _: None = Depends(require_admin),
+    force: bool = False,
+) -> dict[str, str | bool | dict]:
+    if not _SHA256_HEX.match(content_sha256):
+        raise HTTPException(status_code=400, detail="content_sha256 must be 64 hex chars")
+    content_sha256 = content_sha256.lower()
+    reg = DocumentRegistry()
+    if reg.get(content_sha256) is None:
+        raise HTTPException(status_code=404, detail="Unknown document")
+    try:
+        out = run_chunk_for_sha256(content_sha256, force=force)
+    except Exception as e:
+        log.exception("admin rechunk failed")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return {"rechunked": True, "content_sha256": content_sha256, "force": force, "detail": out}
+
+
+@app.post("/v1/admin/documents/{content_sha256}/reprocess")
+@limiter.limit(_admin_rate_limit)
+def admin_reprocess_document(
+    request: Request,
+    content_sha256: str,
+    _: None = Depends(require_admin),
+    force: bool = False,
+) -> dict[str, str | bool | dict]:
+    """Re-run extract → chunk → index from the stored ``source.pdf`` (404 if source missing)."""
+    if not _SHA256_HEX.match(content_sha256):
+        raise HTTPException(status_code=400, detail="content_sha256 must be 64 hex chars")
+    content_sha256 = content_sha256.lower()
+    reg = DocumentRegistry()
+    if reg.get(content_sha256) is None:
+        raise HTTPException(status_code=404, detail="Unknown document")
+    try:
+        out = run_reprocess_for_sha256(content_sha256, force=force)
+    except RuntimeError as e:
+        msg = str(e)
+        if "Source PDF missing" in msg or "missing" in msg.lower():
+            raise HTTPException(status_code=409, detail=msg) from e
+        raise HTTPException(status_code=500, detail=msg) from e
+    except Exception as e:
+        log.exception("admin reprocess failed")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return {"reprocessed": True, "content_sha256": content_sha256, "force": force, "detail": out}
 
 
 configure_prometheus(app)
