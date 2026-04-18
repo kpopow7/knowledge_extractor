@@ -1,0 +1,6 @@
+pymupdf>=1.27.0,<2
+pydantic>=2.0,<3
+numpy>=1.26.0,<3
+openai>=1.40.0,<2
+cohere>=5.0.0,<7
+sentence-transformers>=3.0.0,<5

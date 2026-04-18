@@ -1,0 +1,3 @@
+# Example eval cases — replace gold_* with real chunk_ids/pages from your index.
+{"id": "ex1", "question": "What product line is covered?", "gold_substrings": ["MODERN PRECIOUS METALS"]}
+{"id": "ex2", "question": "revision history table", "gold_substrings": ["Revision", "Date"]}
