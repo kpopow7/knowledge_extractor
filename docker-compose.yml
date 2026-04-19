@@ -15,6 +15,21 @@ services:
     volumes:
       - redis_data:/data
 
+  # Local S3-compatible API: docker compose --profile object-storage up -d minio
+  # Then create a bucket and set RAG_S3_BUCKET, AWS_ENDPOINT_URL=http://minio:9000, etc.
+  minio:
+    image: minio/minio:latest
+    profiles: ["object-storage"]
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-miniosecret}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+
   api:
     build: .
     ports:
@@ -63,3 +78,4 @@ volumes:
   rag_data:
   redis_data:
   pg_data:
+  minio_data:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import contextmanager
 from typing import Iterator
@@ -7,6 +8,8 @@ from typing import Iterator
 import psycopg
 
 from rag_storage.config import database_url
+
+log = logging.getLogger(__name__)
 
 # text-embedding-3-small default dimensions; override if you use another fixed size
 PG_VECTOR_DIM = int(os.environ.get("RAG_PG_VECTOR_DIM", "1536"))
@@ -89,6 +92,30 @@ def init_schema() -> None:
             ON index_chunks USING GIN (to_tsvector('english', fts_body))
             """
         )
+        _maybe_create_hnsw_index(conn)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tenant_usage (
+              tenant_id TEXT NOT NULL,
+              day_utc TEXT NOT NULL,
+              asks INTEGER NOT NULL DEFAULT 0,
+              retrieves INTEGER NOT NULL DEFAULT 0,
+              ingests INTEGER NOT NULL DEFAULT 0,
+              PRIMARY KEY (tenant_id, day_utc)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS embedding_cache (
+              cache_key VARCHAR(64) PRIMARY KEY,
+              model TEXT NOT NULL,
+              dims INTEGER NOT NULL,
+              vec_json JSONB NOT NULL,
+              created_at TEXT NOT NULL
+            )
+            """
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS ingest_jobs (
@@ -105,3 +132,22 @@ def init_schema() -> None:
             """
         )
         conn.execute("ALTER TABLE ingest_jobs ADD COLUMN IF NOT EXISTS tenant_id TEXT")
+
+
+def _maybe_create_hnsw_index(conn: psycopg.Connection) -> None:
+    """ANN index for scale; disable with RAG_PG_DISABLE_HNSW=1 if unsupported or for tests."""
+    v = (os.environ.get("RAG_PG_DISABLE_HNSW") or "").strip().lower()
+    if v in ("1", "true", "yes"):
+        return
+    try:
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_index_chunks_embedding_hnsw
+            ON index_chunks USING hnsw (embedding vector_cosine_ops)
+            """
+        )
+    except psycopg.Error as e:
+        log.warning(
+            "Could not create HNSW index on index_chunks.embedding (set RAG_PG_DISABLE_HNSW=1 to skip): %s",
+            e,
+        )

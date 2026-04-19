@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from rag_extractor.paths import storage_root
+from rag_storage.config import use_postgres
 
 _lock = threading.Lock()
 
@@ -44,6 +45,10 @@ def _connect() -> sqlite3.Connection:
 
 
 def get_counts(tenant_id: str, day: str | None = None) -> tuple[int, int, int]:
+    if use_postgres():
+        from rag_api import usage_store_pg
+
+        return usage_store_pg.get_counts(tenant_id, day)
     d = day or _today()
     with _lock:
         with _connect() as conn:
@@ -59,6 +64,11 @@ def get_counts(tenant_id: str, day: str | None = None) -> tuple[int, int, int]:
 def increment(tenant_id: str, field: str) -> None:
     if field not in ("asks", "retrieves", "ingests"):
         raise ValueError("field must be asks, retrieves, or ingests")
+    if use_postgres():
+        from rag_api import usage_store_pg
+
+        usage_store_pg.increment(tenant_id, field)
+        return
     d = _today()
     col = field
     with _lock:

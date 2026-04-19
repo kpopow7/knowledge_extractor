@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from rag_extractor.paths import storage_root
+from rag_storage.config import use_postgres
 
 log = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
-def _cache_key(model: str, text: str) -> str:
+def embedding_cache_key(model: str, text: str) -> str:
     h = hashlib.sha256()
     h.update(model.encode("utf-8"))
     h.update(b"\0")
@@ -61,7 +62,12 @@ def lookup(model: str, texts: list[str]) -> tuple[list[list[float] | None], list
     if not cache_enabled() or n == 0:
         return slots, list(range(n))
 
-    keys = [_cache_key(model, t) for t in texts]
+    if use_postgres():
+        from rag_index import embedding_cache_pg
+
+        return embedding_cache_pg.lookup(model, texts)
+
+    keys = [embedding_cache_key(model, t) for t in texts]
     with _lock:
         conn = _connect()
         try:
@@ -82,12 +88,17 @@ def lookup(model: str, texts: list[str]) -> tuple[list[list[float] | None], list
 def store(model: str, texts: list[str], vectors: list[list[float]]) -> None:
     if not cache_enabled() or not texts:
         return
+    if use_postgres():
+        from rag_index import embedding_cache_pg
+
+        embedding_cache_pg.store(model, texts, vectors)
+        return
     now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     with _lock:
         conn = _connect()
         try:
             for t, vec in zip(texts, vectors, strict=True):
-                k = _cache_key(model, t)
+                k = embedding_cache_key(model, t)
                 conn.execute(
                     """
                     INSERT INTO embeddings (cache_key, model, dims, vec_json, created_at)
